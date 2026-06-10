@@ -124,6 +124,17 @@ docker run -e VIYA_ENDPOINT=https://your-viya-server.com -p 8134:8134 sas-mcp-se
 - **list_models_and_decisions**: List published MAS modules
 - **score_data**: Score data against a published model
 
+#### Report Building (Visual Analytics authoring)
+- **get_report_content**: Get a report's full content (BIRD definition)
+- **create_report**: Create a new (empty) Visual Analytics report
+- **update_report_content**: Save report content (with ETag handling)
+- **validate_report_content**: Validate report content against the schema
+- **delete_report**: Delete a report
+- **create_report_from_template**: Clone an existing report onto a new CAS table, with optional column remapping
+- **export_report_pdf**: Export a report as a PDF file
+- **get_export_job**: Poll a Visual Analytics export job
+- **explain_data**: Natural-language insights about a table column (SAS Insights)
+
 ### Prompt Templates
 
 - **debug_sas_log**: Analyze SAS log for errors with root-cause explanations
@@ -134,6 +145,7 @@ docker run -e VIYA_ENDPOINT=https://your-viya-server.com -p 8134:8134 sas-mcp-se
 - **explain_sas_code**: Block-by-block code explanation
 - **sas_macro_builder**: Build production-quality SAS macros
 - **generate_report**: Generate ODS/PROC REPORT code
+- **build_va_report**: Guide the end-to-end workflow for building a Visual Analytics report from a CAS table
 
 ## MCP Client Configuration
 
@@ -248,7 +260,7 @@ Integration tests call every tool against a live Viya environment. They require 
 
 | File | Description |
 |---|---|
-| `tests/test_tool_payloads.py` | Payload assertions for all 26 tools — verifies URL paths, JSON body structure, query params, and headers |
+| `tests/test_tool_payloads.py` | Payload assertions for all 35 tools — verifies URL paths, JSON body structure, query params, and headers |
 | `tests/test_integration.py` | End-to-end workflow tests against a real Viya instance |
 | `tests/test_tools.py` | Unit tests for HTTP helper functions (`_get_json`, `_post_json`, etc.) |
 | `tests/test_viya_utils.py` | Unit tests for Viya compute session and job utilities |

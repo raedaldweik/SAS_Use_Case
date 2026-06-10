@@ -3,6 +3,13 @@
 ## [Unreleased]
 
 ### Added
+- **Tier 6 — Report Building (Visual Analytics authoring)**: 9 new MCP tools for creating and editing Visual Analytics reports:
+  - `get_report_content` / `update_report_content` / `validate_report_content` — read, save (with ETag concurrency handling), and schema-validate report content (BIRD model, `application/vnd.sas.report.content+json`) via the Reports service
+  - `create_report` / `delete_report` — create a report in a folder (defaults to My Folder) and delete reports
+  - `create_report_from_template` — clone an existing report onto a different CAS table via the Report Transforms service (`/reportTransforms/dataMappedReports`), with automatic template data-source detection and optional column remapping
+  - `export_report_pdf` / `get_export_job` — export a report to PDF via the Visual Analytics service and poll export jobs
+  - `explain_data` — natural-language insights about a table column via the Insights service (`/insights/explain`)
+- **`build_va_report` prompt template** — guides an LLM through the full report-building workflow (inspect data → pick template or author BIRD content → validate → render → export)
 - **26 new MCP tools** across five tiers:
   - **Tier 1 — Data Discovery**: `list_cas_servers`, `list_caslibs`, `list_castables`, `get_castable_info`, `get_castable_columns`, `get_castable_data`
   - **Tier 2 — Data Operations & Files**: `upload_data`, `promote_table_to_memory`, `list_files`, `upload_file`, `download_file`

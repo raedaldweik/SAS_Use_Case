@@ -660,3 +660,280 @@ def register_tools(mcp, get_token):
             return await _post_json(
                 f"/microanalyticScore/modules/{module_id}/steps/{step_id}", client,
                 body=body)
+
+    # ------------------------------------------------------------------
+    # Tier 6 — Report Building (Visual Analytics authoring)
+    # ------------------------------------------------------------------
+
+    REPORT_CONTENT_TYPE = "application/vnd.sas.report.content+json"
+
+    @mcp.tool()
+    async def get_report_content(report_id: str, ctx: Context) -> dict:
+        """Get the full content (BIRD definition) of a Visual Analytics report.
+
+        The content describes the report's pages, visual elements (charts,
+        tables, KPIs), data sources, and data queries. Use it to learn the
+        structure of existing reports before authoring or editing one.
+
+        Args:
+            report_id: ID of the report.
+        """
+        logger.info("--- TOOL USED: get_report_content ---")
+        token = await get_token(ctx)
+        async with _make_client(token) as client:
+            return await _get_json(f"/reports/reports/{report_id}/content",
+                                   client, accept=REPORT_CONTENT_TYPE)
+
+    @mcp.tool()
+    async def create_report(report_name: str, ctx: Context,
+                            description: str = "",
+                            parent_folder_uri: Optional[str] = None) -> dict:
+        """Create a new (empty) Visual Analytics report.
+
+        The report is created without content; use update_report_content to
+        save its definition afterwards.
+
+        Args:
+            report_name: Name for the new report.
+            description: Optional report description.
+            parent_folder_uri: Folder URI to create the report in
+                (e.g. '/folders/folders/{folderId}'). Defaults to the
+                user's personal folder (My Folder).
+        """
+        logger.info("--- TOOL USED: create_report ---")
+        token = await get_token(ctx)
+        async with _make_client(token) as client:
+            if not parent_folder_uri:
+                folder = await _get_json("/folders/folders/@myFolder", client)
+                parent_folder_uri = f"/folders/folders/{folder.get('id')}"
+            return await _post_json(
+                "/reports/reports", client,
+                body={"name": report_name, "description": description},
+                params={"parentFolderUri": parent_folder_uri})
+
+    @mcp.tool()
+    async def update_report_content(report_id: str, content: dict,
+                                    ctx: Context) -> dict:
+        """Save the content (BIRD definition) of a Visual Analytics report.
+
+        The content must be valid report content JSON
+        (application/vnd.sas.report.content+json). Validate it first with
+        validate_report_content, and verify the result visually with
+        get_report_image.
+
+        Args:
+            report_id: ID of the report to update.
+            content: Report content JSON (the BIRD model).
+        """
+        logger.info("--- TOOL USED: update_report_content ---")
+        token = await get_token(ctx)
+        import json as _json
+        from .viya_utils import VIYA_ENDPOINT
+        async with _make_client(token) as client:
+            # Fetch the current content to obtain the ETag required by the
+            # Reports service for optimistic-concurrency on saves.
+            get_resp = await client.get(
+                f"{VIYA_ENDPOINT}/reports/reports/{report_id}/content",
+                headers={"Accept": REPORT_CONTENT_TYPE})
+            get_resp.raise_for_status()
+            etag = get_resp.headers.get("etag", "")
+            headers = {"Content-Type": REPORT_CONTENT_TYPE,
+                       "Accept": "application/json"}
+            if etag:
+                headers["If-Match"] = etag
+            resp = await client.put(
+                f"{VIYA_ENDPOINT}/reports/reports/{report_id}/content",
+                content=_json.dumps(content).encode("utf-8"),
+                headers=headers)
+            resp.raise_for_status()
+            return {"status": "saved", "reportId": report_id}
+
+    @mcp.tool()
+    async def validate_report_content(content: dict, ctx: Context) -> dict:
+        """Validate Visual Analytics report content against the report schema.
+
+        Use this before saving generated content with update_report_content.
+
+        Args:
+            content: Report content JSON (the BIRD model) to validate.
+        """
+        logger.info("--- TOOL USED: validate_report_content ---")
+        token = await get_token(ctx)
+        import json as _json
+        from .viya_utils import VIYA_ENDPOINT
+        async with _make_client(token) as client:
+            resp = await client.post(
+                f"{VIYA_ENDPOINT}/reports/content/validation",
+                content=_json.dumps(content).encode("utf-8"),
+                headers={"Content-Type": REPORT_CONTENT_TYPE,
+                         "Accept": "application/vnd.sas.report.content.validation+json, application/json"})
+            resp.raise_for_status()
+            return resp.json()
+
+    @mcp.tool()
+    async def delete_report(report_id: str, ctx: Context) -> str:
+        """Delete a Visual Analytics report.
+
+        Args:
+            report_id: ID of the report to delete.
+        """
+        logger.info("--- TOOL USED: delete_report ---")
+        token = await get_token(ctx)
+        async with _make_client(token) as client:
+            await _delete_resource(f"/reports/reports/{report_id}", client)
+            return f"Report {report_id} deleted."
+
+    @mcp.tool()
+    async def create_report_from_template(template_report_id: str,
+                                          new_report_name: str,
+                                          server_id: str, caslib_name: str,
+                                          table_name: str, ctx: Context,
+                                          original_table: Optional[str] = None,
+                                          parent_folder_uri: Optional[str] = None,
+                                          column_mappings: Optional[dict] = None) -> dict:
+        """Create a new Visual Analytics report from an existing report (template) by swapping its data source.
+
+        Clones the template report and rebinds it to a different CAS table,
+        optionally remapping individual columns. This is the most reliable way
+        to build a polished report for new data.
+
+        Args:
+            template_report_id: ID of the existing report to use as a template.
+            new_report_name: Name for the resulting report.
+            server_id: CAS server of the replacement table.
+            caslib_name: Caslib of the replacement table.
+            table_name: Name of the replacement CAS table.
+            original_table: Table name of the template's data source to replace.
+                Only needed when the template uses more than one data source.
+            parent_folder_uri: Folder URI to save the new report in. Defaults
+                to the user's personal folder.
+            column_mappings: Optional mapping of original column names in the
+                template's table to replacement column names in the new table,
+                e.g. {"sales": "revenue", "region": "territory"}. Columns with
+                identical names are matched automatically.
+        """
+        logger.info("--- TOOL USED: create_report_from_template ---")
+        token = await get_token(ctx)
+        async with _make_client(token) as client:
+            content = await _get_json(
+                f"/reports/reports/{template_report_id}/content", client,
+                accept=REPORT_CONTENT_TYPE)
+            cas_sources = [ds.get("casResource") for ds in content.get("dataSources", [])
+                           if isinstance(ds, dict) and ds.get("casResource")]
+            if original_table:
+                matches = [c for c in cas_sources
+                           if c.get("table", "").lower() == original_table.lower()]
+            else:
+                matches = cas_sources
+            if len(matches) != 1:
+                return {
+                    "error": "Could not determine which data source of the template to replace. "
+                             "Specify 'original_table' with one of the template's tables.",
+                    "templateDataSources": cas_sources,
+                }
+            original = matches[0]
+
+            replacement = {
+                "purpose": "replacement",
+                "namePattern": "serverLibraryTable",
+                "server": server_id,
+                "library": caslib_name,
+                "table": table_name,
+                "replacementLabel": table_name,
+            }
+            if column_mappings:
+                replacement["dataItemReplacements"] = [
+                    {"originalColumn": orig, "replacementColumn": repl}
+                    for orig, repl in column_mappings.items()]
+
+            body = {
+                "inputReportUri": f"/reports/reports/{template_report_id}",
+                "resultReportName": new_report_name,
+                "dataSources": [
+                    {"purpose": "original",
+                     "namePattern": "serverLibraryTable",
+                     "server": original.get("server"),
+                     "library": original.get("library"),
+                     "table": original.get("table")},
+                    replacement,
+                ],
+            }
+            if parent_folder_uri:
+                body["resultParentFolderUri"] = parent_folder_uri
+
+            result = await _post_json(
+                "/reportTransforms/dataMappedReports", client, body=body,
+                params={"useSavedReport": "true", "saveResult": "true",
+                        "failOnDataSourceError": "false", "validate": "true"},
+                accept="application/vnd.sas.report.transform+json, application/json")
+            return {
+                "evaluationStatus": result.get("evaluationStatus", ""),
+                "newReport": result.get("resultReport", {}),
+                "messages": result.get("messages", []),
+                "errorMessages": result.get("errorMessages", []),
+            }
+
+    @mcp.tool()
+    async def export_report_pdf(report_id: str, ctx: Context,
+                                wait_seconds: int = 30) -> dict:
+        """Export a Visual Analytics report as a PDF file.
+
+        Starts an export job on the Visual Analytics service. The returned job
+        contains links to the resulting PDF file when complete; poll with
+        get_export_job if the job is still running.
+
+        Args:
+            report_id: ID of the report to export.
+            wait_seconds: Seconds to wait for the export to finish before
+                returning (default 30).
+        """
+        logger.info("--- TOOL USED: export_report_pdf ---")
+        token = await get_token(ctx)
+        async with _make_client(token) as client:
+            return await _post_json(
+                f"/visualAnalytics/reports/{report_id}/exportPdf", client,
+                body={"version": 1, "options": {}, "wait": wait_seconds},
+                accept="application/vnd.sas.visual.analytics.report.export.pdf.job+json, application/json")
+
+    @mcp.tool()
+    async def get_export_job(job_id: str, ctx: Context) -> dict:
+        """Get the status of a Visual Analytics export job (PDF/image/data/package).
+
+        Args:
+            job_id: ID of the export job.
+        """
+        logger.info("--- TOOL USED: get_export_job ---")
+        token = await get_token(ctx)
+        async with _make_client(token) as client:
+            return await _get_json(f"/visualAnalytics/jobs/{job_id}", client)
+
+    @mcp.tool()
+    async def explain_data(server_id: str, caslib_name: str, table_name: str,
+                           target_variable: str, ctx: Context,
+                           date_variable: Optional[str] = None) -> dict:
+        """Explain a column of a CAS table in relation to the other columns (SAS Insights).
+
+        Returns natural-language descriptions of the variable, its outliers,
+        and variable-screening results — useful for deciding which variables
+        to feature when building a report about the data.
+
+        Args:
+            server_id: CAS server name (e.g. 'cas-shared-default').
+            caslib_name: Caslib containing the table.
+            table_name: Name of the table.
+            target_variable: Column to explain.
+            date_variable: Optional time-series column; enables forecast insights.
+        """
+        logger.info("--- TOOL USED: explain_data ---")
+        token = await get_token(ctx)
+        body = {
+            "cas": {"server": server_id, "library": caslib_name,
+                    "table": table_name},
+            "targetVariable": target_variable,
+            "includeVariableDescription": True,
+            "includeOutlierDescription": True,
+        }
+        if date_variable:
+            body["dateVariable"] = date_variable
+        async with _make_client(token) as client:
+            return await _post_json("/insights/explain", client, body=body)

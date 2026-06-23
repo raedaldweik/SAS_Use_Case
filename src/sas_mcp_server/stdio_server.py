@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import FastMCPError
 from .config import VIYA_ENDPOINT, CLIENT_ID, CLIENT_SECRET, SSL_VERIFY
-from .auth import select_grant
+from .auth import select_grant, client_request
 from .viya_utils import logger
 from .tools import register_tools
 from .prompts import register_prompts
@@ -56,20 +56,21 @@ def _get_viya_token() -> str:
         return _token_cache["token"]
 
     refresh_token = _token_cache["refresh_token"] or VIYA_REFRESH_TOKEN
-    data = select_grant(
+    grant = select_grant(
         refresh_token=refresh_token,
         username=VIYA_USERNAME,
         password=VIYA_PASSWORD,
     )
-    if data is None:
+    if grant is None:
         raise AuthenticationError(
             "No Viya credentials configured for stdio mode. Set "
             "VIYA_REFRESH_TOKEN (required for SSO/federated environments) "
             "or VIYA_USERNAME and VIYA_PASSWORD in .env."
         )
+    data, auth = client_request(grant, CLIENT_ID, CLIENT_SECRET)
     resp = httpx.post(
         f"{VIYA_ENDPOINT}/SASLogon/oauth/token",
-        auth=(CLIENT_ID, CLIENT_SECRET),
+        auth=auth,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         data=data,
         verify=SSL_VERIFY,

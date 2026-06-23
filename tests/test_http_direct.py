@@ -116,8 +116,23 @@ async def test_get_viya_token_uses_refresh_grant_when_set():
     call = post.call_args
     assert call[1]["data"]["grant_type"] == "refresh_token"
     assert call[1]["data"]["refresh_token"] == "rt-1"
-    # The client is authenticated with CLIENT_ID and (empty) CLIENT_SECRET.
-    assert call[1]["auth"] == (hds.CLIENT_ID, hds.CLIENT_SECRET)
+    # Public/PKCE client: client_id in the body, NO Basic auth header.
+    assert call[1]["data"]["client_id"] == hds.CLIENT_ID
+    assert call[1]["auth"] is None
+
+
+async def test_confidential_client_uses_basic_auth():
+    post = AsyncMock(return_value=_mock_token_response("tok-r"))
+    with patch.object(hds, "VIYA_REFRESH_TOKEN", "rt-1"), \
+         patch.object(hds, "VIYA_USERNAME", ""), \
+         patch.object(hds, "VIYA_PASSWORD", ""), \
+         patch.object(hds, "CLIENT_SECRET", "shh"), \
+         patch.object(httpx, "AsyncClient",
+                      return_value=_mock_async_client(post)):
+        await hds.get_viya_token()
+
+    call = post.call_args
+    assert call[1]["auth"] == (hds.CLIENT_ID, "shh")
 
 
 async def test_refresh_grant_preferred_over_password():

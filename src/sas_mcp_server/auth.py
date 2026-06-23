@@ -44,3 +44,18 @@ def select_grant(refresh_token: str = "", username: str = "",
             "password": password,
         }
     return None
+
+
+def client_request(grant_data: dict, client_id: str,
+                   client_secret: str = "") -> tuple[dict, tuple | None]:
+    """Return ``(data, auth)`` for a SAS Logon ``/oauth/token`` request.
+
+    Public clients (registered ``allowpublic``/PKCE, no secret) must send
+    ``client_id`` in the request **body** with **no** HTTP Basic auth header —
+    SAS Logon rejects an empty-secret Basic header with
+    ``invalid_client`` / "Missing credentials". Confidential clients (a secret
+    is configured) authenticate with HTTP Basic auth.
+    """
+    data = {**grant_data, "client_id": client_id}
+    auth = (client_id, client_secret) if client_secret else None
+    return data, auth

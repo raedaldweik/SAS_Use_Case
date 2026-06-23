@@ -189,16 +189,23 @@ def main():
         sys.exit("Authorization failed: no authorization code returned.")
 
     print("Authorization code received. Exchanging for tokens...")
+    # Public (PKCE) clients send client_id in the body with NO Basic auth
+    # header; an empty-secret Basic header makes SAS Logon reject the request
+    # with invalid_client / "Missing credentials". Confidential clients (a
+    # secret is set) use HTTP Basic auth.
+    token_data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "code_verifier": verifier,
+        "client_id": CLIENT_ID,
+    }
+    auth = (CLIENT_ID, CLIENT_SECRET) if CLIENT_SECRET else None
     resp = httpx.post(
         f"{VIYA_ENDPOINT}/SASLogon/oauth/token",
-        auth=(CLIENT_ID, CLIENT_SECRET),
+        auth=auth,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri,
-            "code_verifier": verifier,
-        },
+        data=token_data,
         verify=_ssl_ctx,
         timeout=60.0,
     )

@@ -16,6 +16,8 @@ All tools are registered via ``register_tools(mcp, get_token)``.
 from typing import Optional
 from fastmcp import Context
 from fastmcp.tools import ToolResult
+from fastmcp.utilities.types import Image
+from mcp.types import TextContent
 from .viya_utils import (
     _get_json,
     _get_paged_items,
@@ -52,6 +54,86 @@ def _truncate_output(text, limit=MAX_SAS_OUTPUT_CHARS):
 
 class ScopeError(Exception):
     """Raised when a tool is asked to act on a resource outside the use-case scope."""
+
+
+def _build_chart_png(chart_type, title, subtitle, data, x_key, y_keys, stacked):
+    """Render a chart to PNG bytes with matplotlib (headless Agg backend).
+
+    Returns real image bytes so the chart displays in any MCP host that renders
+    images (e.g. SAS Retrieval Agent Manager), rather than a JSON spec that only
+    a bespoke front-end could draw.
+    """
+    import io
+    import matplotlib
+    matplotlib.use("Agg")  # no display; render straight to a buffer
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    x_labels = [str(row.get(x_key)) for row in data]
+
+    def col(yk):
+        vals = []
+        for row in data:
+            try:
+                vals.append(float(row.get(yk)))
+            except (TypeError, ValueError):
+                vals.append(None)
+        return vals
+
+    fig, ax = plt.subplots(figsize=(9, 5), dpi=120)
+    idx = np.arange(len(x_labels))
+
+    if chart_type == "pie":
+        vals = [v or 0 for v in col(y_keys[0])]
+        ax.pie(vals, labels=x_labels, autopct="%1.1f%%", startangle=90)
+        ax.axis("equal")
+    elif chart_type == "scatter":
+        try:
+            xs = [float(row.get(x_key)) for row in data]
+        except (TypeError, ValueError):
+            xs = list(idx)
+        ax.scatter(xs, [v or 0 for v in col(y_keys[0])])
+        ax.set_xlabel(x_key)
+        ax.set_ylabel(y_keys[0])
+    elif chart_type == "bar":
+        n = max(len(y_keys), 1)
+        if stacked:
+            bottom = np.zeros(len(x_labels))
+            for yk in y_keys:
+                vals = np.array([v or 0 for v in col(yk)], dtype=float)
+                ax.bar(idx, vals, bottom=bottom, label=yk)
+                bottom += vals
+        else:
+            width = 0.8 / n
+            for i, yk in enumerate(y_keys):
+                vals = [v or 0 for v in col(yk)]
+                ax.bar(idx + i * width - 0.4 + width / 2, vals, width, label=yk)
+        ax.set_xticks(idx)
+        ax.set_xticklabels(x_labels, rotation=45, ha="right")
+        if n > 1:
+            ax.legend()
+    else:  # line / area
+        if chart_type == "area" and stacked and len(y_keys) > 1:
+            series = [np.array([v or 0 for v in col(yk)], dtype=float) for yk in y_keys]
+            ax.stackplot(idx, *series, labels=y_keys)
+        else:
+            for yk in y_keys:
+                vals = col(yk)
+                ax.plot(idx, [v if v is not None else np.nan for v in vals],
+                        marker="o", label=yk)
+                if chart_type == "area":
+                    ax.fill_between(idx, [v or 0 for v in vals], alpha=0.3)
+        ax.set_xticks(idx)
+        ax.set_xticklabels(x_labels, rotation=45, ha="right")
+        if len(y_keys) > 1:
+            ax.legend()
+
+    ax.set_title(title if not subtitle else f"{title}\n{subtitle}")
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
 
 
 def register_tools(mcp, get_token):
@@ -191,24 +273,25 @@ def register_tools(mcp, get_token):
     @mcp.tool()
     async def render_chart(chart_type: str, title: str, data: list,
                            x_key: str, y_keys: list, ctx: Context,
-                           subtitle: str = "", stacked: bool = False) -> dict:
-        """Render an interactive chart in the chat UI.
+                           subtitle: str = "", stacked: bool = False) -> ToolResult:
+        """Render a chart as an image and display it in the chat.
 
         Use whenever the user asks to show / plot / visualize / graph / compare
         data, or when a chart makes the answer clearer than text. Call this AFTER
         getting the rows with ``query_table`` (or ``get_castable_data`` for raw
         rows), then pass the rows in as ``data``. Keep ``data`` small — aggregate
-        or limit to just the rows you want to chart.
+        or limit to just the rows you want to chart (e.g. top 10).
 
-        The chart is drawn by the user interface from this call; the tool itself
-        does no plotting and returns the normalized chart spec.
+        The tool renders an actual PNG image server-side and returns it, so it
+        appears inline in hosts that display images (such as SAS Retrieval Agent
+        Manager).
 
         Args:
             chart_type: One of bar, line, area, pie, scatter.
             title: Chart title.
             data: List of row objects, e.g. [{"month": "Jan", "sales": 120}, ...].
             x_key: Field for the x-axis / category (for pie, the slice label).
-            y_keys: Field(s) plotted as series / values (for pie or scatter, one or two).
+            y_keys: Field(s) plotted as series / values (for pie or scatter, use one).
             subtitle: Optional subtitle.
             stacked: For bar/area, stack the series instead of grouping them.
         """
@@ -221,22 +304,27 @@ def register_tools(mcp, get_token):
             raise ValueError("data must be a non-empty list of row objects.")
         if not isinstance(data[0], dict):
             raise ValueError("each item in data must be an object (key/value row).")
+        if not y_keys:
+            raise ValueError("y_keys must list at least one field to plot.")
         keys = list(data[0].keys())
         missing = [k for k in [x_key, *y_keys] if k not in keys]
         if missing:
             raise ValueError(
                 f"these keys are not present in the data rows: {', '.join(missing)}. "
                 f"Available keys: {', '.join(keys)}.")
-        return {
-            "kind": "chart",
-            "type": ct,
-            "title": title,
-            "subtitle": subtitle,
-            "data": data,
-            "xKey": x_key,
-            "yKeys": list(y_keys),
-            "stacked": bool(stacked),
-        }
+        png = _build_chart_png(ct, title, subtitle, data, x_key, list(y_keys),
+                               bool(stacked))
+        image = Image(data=png, format="png")
+        # Return the image plus a short text confirmation so the host displays
+        # the chart and the model knows it succeeded. Light structured content
+        # (no row data echo) keeps the result small.
+        return ToolResult(
+            content=[image.to_image_content(),
+                     TextContent(type="text",
+                                 text=f"Rendered a {ct} chart titled '{title}'.")],
+            structured_content={"kind": "chart", "type": ct, "title": title,
+                                "points": len(data)},
+        )
 
     # ------------------------------------------------------------------
     # Data inspection (defaults to the use-case table)

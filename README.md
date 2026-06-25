@@ -130,7 +130,7 @@ The data tools default to the use-case table, so you rarely pass table names.
 - **get_castable_data**: Fetch raw sample rows from the use-case table
 
 #### Visualization
-- **render_chart**: Emit an interactive chart spec (bar/line/area/pie/scatter) for the UI to render — pair it with `query_table`
+- **render_chart**: Render a chart as a PNG image (bar/line/area/pie/scatter) server-side so it displays inline in the chat — pair it with `query_table`
 
 #### Ready models & decisions (real-time scoring)
 - **list_models_and_decisions**: List the ready (published) models and decisions you can score against (MAS modules)

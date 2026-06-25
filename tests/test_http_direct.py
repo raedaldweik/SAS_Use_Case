@@ -254,7 +254,13 @@ async def test_all_tools_registered_on_direct_server():
     async with Client(hds.mcp) as client:
         tools = await client.list_tools()
         names = {t.name for t in tools}
+    # The direct server exposes the lean, use-case-scoped tool set.
     assert "execute_sas_code" in names
-    assert "list_reports" in names
-    assert "create_report_from_template" in names
+    assert "query_table" in names
+    assert "render_chart" in names
     assert "score_data" in names
+    assert "get_ml_project_results" in names
+    # Tools removed when scoping to a single use case must not be present.
+    assert "list_reports" not in names
+    assert "create_report_from_template" not in names
+    assert "submit_batch_job" not in names

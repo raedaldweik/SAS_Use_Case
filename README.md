@@ -1,11 +1,22 @@
-# SAS MCP Server
+# SAS MCP Server — Use-Case Edition
 
-A Model Context Protocol (MCP) server for executing SAS code on SAS Viya environments.
+A Model Context Protocol (MCP) server that turns a single SAS Viya dataset (plus
+its associated models and decisions) into a focused analytics assistant. Point
+it at your data with a few environment variables and the agent becomes an expert
+on that dataset — querying it, charting it, scoring against ready models, and
+building new ones — without being distracted by the rest of the environment.
+
+> This is the **use-case-scoped** edition with a small, purpose-built tool set.
+> For the full SAS Viya copilot (the complete tool surface), use the upstream
+> SAS MCP server.
 
 ## Features
 
-- Execute SAS code on SAS Viya compute contexts
-- OAuth2 authentication with PKCE flow
+- Query a scoped dataset with SAS or SQL and get back structured rows
+- Render interactive charts from query results
+- Score records in real time against ready models and decisions
+- Build ML models with AutoML and read back their performance
+- OAuth2 authentication with PKCE flow (plus headless refresh-token / direct modes)
 - HTTP-based MCP server compatible with MCP clients
 
 ## Getting Started
@@ -95,61 +106,35 @@ docker run -e VIYA_ENDPOINT=https://your-viya-server.com -p 8134:8134 sas-mcp-se
 
 ### Available Tools
 
-#### Code Execution
-- **execute_sas_code**: Execute SAS code snippets and retrieve execution results (log and listing output)
+This server is intentionally focused on a single use case (one dataset plus its
+associated models/decisions), so it exposes a small, purpose-built tool set —
+**14 tools** — rather than the full SAS Viya surface. A focused tool set keeps
+the agent a reliable expert on its data instead of overwhelming it with choices.
+The data tools default to the use-case table, so you rarely pass table names.
 
-#### Data Discovery (CAS Management)
-- **list_cas_servers**: List available CAS servers
-- **list_caslibs**: List CAS libraries on a server
-- **list_castables**: List tables in a CAS library
-- **get_castable_info**: Get table metadata (row count, columns, size)
-- **get_castable_columns**: Get column names, types, labels, formats
-- **get_castable_data**: Fetch sample rows from a CAS table
+#### Use case & grounding
+- **get_use_case**: Report the use case — the primary dataset (with its columns), and the models/decisions this assistant may use. Call this first.
 
-#### Data Operations & Files
-- **upload_data**: Upload CSV data into a CAS table
-- **promote_table_to_memory**: Promote a table to global scope in CAS
-- **list_files**: List files in the Viya Files Service
-- **upload_file**: Upload a file to Viya Files Service
-- **download_file**: Download file content
-
-#### Reports & Visualization
-- **list_reports**: List Visual Analytics reports
-- **get_report**: Get report metadata and definition
-- **get_report_image**: Render a report section as an image
-
-#### Batch Jobs
-- **submit_batch_job**: Submit a SAS job for async execution
-- **get_job_status**: Check job state
-- **list_jobs**: List recent/running jobs
-- **cancel_job**: Cancel a running job
-- **get_job_log**: Retrieve job log
-
-#### Model Management & Scoring
-- **list_ml_projects**: List AutoML projects
-- **create_ml_project**: Create a new AutoML project
-- **run_ml_project**: Run pipeline automation
-- **delete_ml_project**: Delete an AutoML project
-- **list_registered_models**: List models in repository
-- **list_models_and_decisions**: List published MAS modules
-- **score_data**: Score data against a published model
-
-#### Report Building (Visual Analytics authoring)
-- **get_report_content**: Get a report's full content (BIRD definition)
-- **create_report**: Create a new (empty) Visual Analytics report
-- **update_report_content**: Save report content (with ETag handling)
-- **validate_report_content**: Validate report content against the schema
-- **delete_report**: Delete a report
-- **create_report_from_template**: Clone an existing report onto a new CAS table, with optional column remapping
-- **export_report_pdf**: Export a report as a PDF file
-- **get_export_job**: Poll a Visual Analytics export job
-- **explain_data**: Natural-language insights about a table column (SAS Insights)
+#### Querying & code execution
+- **execute_sas_code**: Execute arbitrary SAS code and retrieve the log and listing (data prep, PROC-based modelling, assessment, any SAS step)
+- **query_table**: Run a SQL SELECT and get back **structured rows** (columns + rows) — the right tool for "top N…" questions you then want to chart
+- **get_castable_info**: Get table metadata (row count, columns, size) for the use-case table
+- **get_castable_columns**: Get column names, types, labels, formats for the use-case table
+- **get_castable_data**: Fetch raw sample rows from the use-case table
 
 #### Visualization
-- **render_chart**: Emit an interactive chart spec (bar/line/area/pie/scatter) for the custom UI to render
+- **render_chart**: Emit an interactive chart spec (bar/line/area/pie/scatter) for the UI to render — pair it with `query_table`
 
-#### Use-Case Scoping
-- **get_use_case**: Report the datasets, reports, models, and decisions this assistant is limited to
+#### Ready models & decisions (real-time scoring)
+- **list_models_and_decisions**: List the ready (published) models and decisions you can score against (MAS modules)
+- **score_data**: Score a record against a ready model or decision in real time
+
+#### Model building (AutoML)
+- **list_ml_projects**: List AutoML pipeline automation projects
+- **create_ml_project**: Build a new ML model with AutoML
+- **run_ml_project**: Run (train) an AutoML project
+- **get_ml_project_results**: Get an AutoML project's state, champion model, and leaderboard with fit statistics
+- **delete_ml_project**: Delete an AutoML project
 
 ### Prompt Templates
 
@@ -161,29 +146,32 @@ docker run -e VIYA_ENDPOINT=https://your-viya-server.com -p 8134:8134 sas-mcp-se
 - **explain_sas_code**: Block-by-block code explanation
 - **sas_macro_builder**: Build production-quality SAS macros
 - **generate_report**: Generate ODS/PROC REPORT code
-- **build_va_report**: Guide the end-to-end workflow for building a Visual Analytics report from a CAS table
 
 ## Use-Case Scoping
 
-By default the server exposes the entire SAS Viya environment. To build a chatbot focused on a single use case, scope it to a curated set of resources using environment variables — no code changes:
+This server is designed to be pointed at one use case — a single dataset plus
+its associated models/decisions — and become an expert on it. You do that with
+environment variables, no code changes:
 
 | Variable | Purpose |
 |---|---|
 | `USE_CASE_NAME` / `USE_CASE_DESCRIPTION` | Identify the use case (returned by `get_use_case`) |
-| `ALLOWED_TABLES` | CAS tables — `table`, `caslib.table`, or `server.caslib.table` |
-| `ALLOWED_REPORTS` | Report IDs or names |
-| `ALLOWED_MODELS` | Model IDs or names |
-| `ALLOWED_DECISIONS` | Decision / MAS-module IDs or names |
+| `ALLOWED_TABLES` | The dataset(s). The **first** entry is the *primary* table the data tools default to. Each entry: `table`, `caslib.table`, or `server.caslib.table` |
+| `ALLOWED_MODELS` | Ready model IDs or names the agent may score against |
+| `ALLOWED_DECISIONS` | Decision / MAS-module IDs or names the agent may score against |
+| `DEFAULT_CAS_SERVER` | CAS server used when a table entry omits it (default `cas-shared-default`) |
+| `DEFAULT_CASLIB` | Caslib used when a table entry omits it (default `Public`) |
 | `SCOPE_ENFORCE` | `true` (default) blocks out-of-scope access; `false` only hides it from listings |
 
 Entries are comma- or newline-separated and matched case-insensitively against both IDs and names. When a scope is active:
 
-- list tools (`list_reports`, `list_castables`, `list_registered_models`, `list_models_and_decisions`) return **only** the allowed resources;
-- `get_use_case` tells the agent its scope deterministically (so you don't rely on the system prompt);
-- resource-access tools (e.g. `get_report_content`, `score_data`, `explain_data`) **refuse** out-of-scope IDs when `SCOPE_ENFORCE=true`;
-- `execute_sas_code` remains unrestricted.
+- the data tools (`get_castable_info`/`columns`/`data`, `query_table`) **default to the primary table** — the agent calls them with no table arguments;
+- `get_use_case` tells the agent its scope deterministically, including the primary table's **columns**, so it's grounded without relying on the system prompt;
+- `list_models_and_decisions` returns **only** the allowed models/decisions;
+- `score_data` **refuses** out-of-scope modules when `SCOPE_ENFORCE=true`;
+- `execute_sas_code` and `query_table` remain unrestricted (so the agent can still freely analyse its dataset).
 
-With none of the `ALLOWED_*` variables set, the server behaves exactly as before (full access). This makes it easy to stand up many per-use-case assistants from one image — for example, in **SAS Retrieval Agent Manager**, register the container once as a **Container MCP Server** code template, then create one tool server per use case and set these variables on its Environment Variables tab.
+With none of the `ALLOWED_*` variables set, the server has full access to the environment. This makes it easy to stand up many per-use-case assistants from one image — for example, in **SAS Retrieval Agent Manager**, register the container once as a **Container MCP Server** code template, then create one tool server per use case and set these variables on its Environment Variables tab.
 
 ## MCP Client Configuration
 
@@ -298,7 +286,8 @@ Integration tests call every tool against a live Viya environment. They require 
 
 | File | Description |
 |---|---|
-| `tests/test_tool_payloads.py` | Payload assertions for all 35 tools — verifies URL paths, JSON body structure, query params, and headers |
+| `tests/test_tool_payloads.py` | Payload assertions for the 14 tools — verifies the tool set, URL paths, JSON body structure, query params, and headers |
+| `tests/test_usecase.py` | Use-case scoping, auto-scope resolution, and guard/filter behavior |
 | `tests/test_integration.py` | End-to-end workflow tests against a real Viya instance |
 | `tests/test_tools.py` | Unit tests for HTTP helper functions (`_get_json`, `_post_json`, etc.) |
 | `tests/test_viya_utils.py` | Unit tests for Viya compute session and job utilities |

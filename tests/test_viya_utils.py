@@ -13,6 +13,8 @@ from sas_mcp_server.viya_utils import (
     submit_job,
     wait_job,
     run_one_snippet,
+    run_query_rows,
+    fetch_session_table_rows,
     fetch_full_job_log,
     fetch_full_job_listing,
     fetch_full_session_log,
@@ -318,8 +320,114 @@ async def test_run_one_snippet_with_bearer_prefix(sample_sas_code, mock_env_vars
         mock_client.delete.return_value = mock_delete_response
         
         result = await run_one_snippet(sample_sas_code, "1", token_with_bearer)
-        
+
         # Verify the client was created with Bearer token
         call_kwargs = mock_client_class.call_args[1]
         assert "Authorization" in call_kwargs["headers"]
         assert call_kwargs["headers"]["Authorization"] == token_with_bearer
+
+
+@pytest.mark.asyncio
+async def test_fetch_session_table_rows(mock_httpx_client):
+    """Columns + rows are zipped into row dicts via the Compute data API."""
+    col_resp = AsyncMock()
+    col_resp.raise_for_status = MagicMock()
+    col_resp.json = MagicMock(return_value={
+        "items": [{"name": "nationality"}, {"name": "n"}]})
+    row_resp = AsyncMock()
+    row_resp.raise_for_status = MagicMock()
+    row_resp.json = MagicMock(return_value={
+        "items": [{"cells": ["KW", 10]}, {"cells": ["AE", 7]}]})
+    mock_httpx_client.get.side_effect = [col_resp, row_resp]
+
+    cols, rows = await fetch_session_table_rows(
+        mock_httpx_client, "sess-1", "WORK", "_MCPQ", limit=50)
+
+    assert cols == ["nationality", "n"]
+    assert rows == [{"nationality": "KW", "n": 10}, {"nationality": "AE", "n": 7}]
+    # The two calls hit the columns and rows sub-resources of the session table.
+    col_url = mock_httpx_client.get.call_args_list[0][0][0]
+    row_url = mock_httpx_client.get.call_args_list[1][0][0]
+    assert "/compute/sessions/sess-1/data/WORK/_MCPQ/columns" in col_url
+    assert "/compute/sessions/sess-1/data/WORK/_MCPQ/rows" in row_url
+
+
+@pytest.mark.asyncio
+async def test_run_query_rows_success(mock_access_token, mock_env_vars):
+    """run_query_rows wraps the SELECT, runs it, and returns structured rows."""
+    with patch('sas_mcp_server.viya_utils.httpx.AsyncClient') as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client_class.return_value.__aenter__.return_value = mock_client
+
+        def _resp(json_data=None, text=None):
+            r = AsyncMock()
+            r.raise_for_status = MagicMock()
+            r.json = MagicMock(return_value=json_data or {})
+            if text is not None:
+                r.text = text
+            return r
+
+        # GET order: context, job-state, log, listing, columns, rows
+        mock_client.get.side_effect = [
+            _resp({"items": [{"id": "ctx-id"}]}),
+            _resp(text="completed"),
+            _resp({"items": [{"line": "NOTE: ok"}]}),
+            _resp({"items": [{"line": "out"}]}),
+            _resp({"items": [{"name": "bad"}, {"name": "n"}]}),
+            _resp({"items": [{"cells": [0, 4771]}, {"cells": [1, 1189]}]}),
+        ]
+        mock_client.post.side_effect = [
+            _resp({"id": "sess-id"}),   # create_session
+            _resp({"id": "job-id"}),    # submit_job
+        ]
+        mock_client.delete.return_value = _resp()
+
+        result = await run_query_rows(
+            "select bad, count(*) as n from Public.HMEQ group by bad",
+            mock_access_token, limit=10)
+
+        assert result["error"] is False
+        assert result["state"] == "completed"
+        assert result["columns"] == ["bad", "n"]
+        assert result["rows"] == [{"bad": 0, "n": 4771}, {"bad": 1, "n": 1189}]
+        assert result["rowCount"] == 2
+
+        # The SELECT is wrapped in proc sql writing to WORK._MCPQ.
+        submitted_code = "\n".join(mock_client.post.call_args_list[1][1]["json"]["code"])
+        assert "create table work._mcpq as" in submitted_code
+        assert "group by bad" in submitted_code
+
+
+@pytest.mark.asyncio
+async def test_run_query_rows_error_returns_log(mock_access_token, mock_env_vars):
+    """A SAS error returns the log instead of rows so the caller can correct it."""
+    with patch('sas_mcp_server.viya_utils.httpx.AsyncClient') as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client_class.return_value.__aenter__.return_value = mock_client
+
+        def _resp(json_data=None, text=None):
+            r = AsyncMock()
+            r.raise_for_status = MagicMock()
+            r.json = MagicMock(return_value=json_data or {})
+            if text is not None:
+                r.text = text
+            return r
+
+        mock_client.get.side_effect = [
+            _resp({"items": [{"id": "ctx-id"}]}),
+            _resp(text="error"),
+            _resp({"items": [{"line": "ERROR: Syntax error"}]}),
+            _resp({"items": []}),
+        ]
+        mock_client.post.side_effect = [
+            _resp({"id": "sess-id"}),
+            _resp({"id": "job-id"}),
+        ]
+        mock_client.delete.return_value = _resp()
+
+        result = await run_query_rows("select oops", mock_access_token)
+
+        assert result["error"] is True
+        assert result["state"] == "error"
+        assert "ERROR: Syntax error" in result["log"]
+        assert result["rows"] == []

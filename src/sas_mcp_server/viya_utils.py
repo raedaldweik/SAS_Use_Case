@@ -227,3 +227,88 @@ async def run_one_snippet(snippet_data, snippet_id, token):
             except Exception as e:
                 logger.error(f"Failed to delete session {sid}: {str(e)}")
                 raise e
+
+
+# ---------------------------------------------------------------------------
+# Structured query helpers (used by the use-case query/grounding tools)
+# ---------------------------------------------------------------------------
+
+async def fetch_table_columns(client, server, caslib, table, limit=500):
+    """Return column metadata for a CAS table via CAS Management.
+
+    A light wrapper used to ground the agent (e.g. inside get_use_case) without
+    making it write PROC CONTENTS and parse the log.
+    """
+    items, _ = await _get_paged_items(
+        f"/casManagement/servers/{server}/caslibs/{caslib}/tables/{table}/columns",
+        client, limit=limit)
+    return [{"name": c.get("name"), "type": c.get("type"),
+             "label": c.get("label", ""), "format": c.get("format", "")}
+            for c in items]
+
+
+async def fetch_session_table_rows(client, session_id, libref, table_name,
+                                   limit=100):
+    """Fetch a table's columns and rows from inside a live compute session.
+
+    Uses the Compute data API
+    (``/compute/sessions/{id}/data/{libref}/{table}/...``) so a result built in
+    WORK can be read back as structured rows before the session is torn down.
+    Returns ``(column_names, rows)`` where each row is a ``{column: value}`` dict.
+    """
+    base = f"{VIYA_ENDPOINT}/compute/sessions/{session_id}/data/{libref}/{table_name}"
+    col_resp = await client.get(
+        f"{base}/columns", params={"start": 0, "limit": 10000},
+        headers={"Accept": "application/vnd.sas.collection+json"})
+    col_resp.raise_for_status()
+    col_names = [c.get("name") for c in col_resp.json().get("items", [])]
+    row_resp = await client.get(
+        f"{base}/rows", params={"start": 0, "limit": limit},
+        headers={"Accept": "application/vnd.sas.collection+json"})
+    row_resp.raise_for_status()
+    rows = []
+    for item in row_resp.json().get("items", []):
+        cells = item.get("cells", [])
+        rows.append(dict(zip(col_names, cells)))
+    return col_names, rows
+
+
+async def run_query_rows(sql, token, limit=100):
+    """Run a single SQL SELECT and return the result set as structured rows.
+
+    Wraps the SELECT in ``proc sql`` (writing to ``WORK._MCPQ``) inside a fresh
+    compute session, then reads the result back through the Compute data API —
+    so it works even though each call uses a throwaway session that is deleted
+    afterwards. On success returns ``{"error": False, "columns": [...],
+    "rows": [...], "rowCount": n}``; on a SAS error returns ``{"error": True,
+    "state": ..., "log": ...}`` so the caller can correct the query.
+    """
+    statement = (sql or "").strip().rstrip(";")
+    # `caslib _all_ assign` exposes CAS caslibs as SAS librefs so the SELECT can
+    # reference the use-case table by its caslib-qualified name.
+    code = (
+        "cas _mcpcas;\n"
+        "caslib _all_ assign;\n"
+        "proc sql;\n"
+        "  create table work._mcpq as\n"
+        f"  {statement};\n"
+        "quit;"
+    )
+    async with _make_client(token) as client:
+        ctx_id = await get_context_id(client, CONTEXT_NAME)
+        sid = await create_session(client, ctx_id, name="mcp-query")
+        try:
+            jid = await submit_job(client, sid, code)
+            state, log_text, _ = await wait_job(client, sid, jid)
+            if state not in ("completed", "warning"):
+                return {"error": True, "state": state, "log": log_text,
+                        "columns": [], "rows": []}
+            cols, rows = await fetch_session_table_rows(
+                client, sid, "WORK", "_MCPQ", limit=limit)
+            return {"error": False, "state": state, "columns": cols,
+                    "rows": rows, "rowCount": len(rows)}
+        finally:
+            try:
+                await client.delete(f"{VIYA_ENDPOINT}/compute/sessions/{sid}")
+            except Exception as e:
+                logger.error(f"Failed to delete query session {sid}: {str(e)}")

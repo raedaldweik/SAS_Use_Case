@@ -25,7 +25,9 @@ jobs:
 
       - name: Set lowercase image name
         id: vars
-        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/sas-mcp-server" >> $GITHUB_OUTPUT
+        # Publish under a DISTINCT package name from the full-copilot server
+        # (sas-mcp-server) so this use-case build never overwrites it.
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/sas-mcp-usecase" >> $GITHUB_OUTPUT
 
       - name: Build and push
         uses: docker/build-push-action@v6

@@ -82,9 +82,16 @@ The server authenticates to Viya itself with the `.env` credentials and serves s
 
 **Option D: Docker / Podman** (containerized deployment)
 ```sh
-docker build -t sas-mcp-server .
-docker run -e VIYA_ENDPOINT=https://your-viya-server.com -p 8134:8134 sas-mcp-server
+docker build -t sas-mcp-usecase .
+docker run -e VIYA_ENDPOINT=https://your-viya-server.com -p 8134:8134 sas-mcp-usecase
 ```
+
+A GitHub Actions workflow (`.github/workflows/build-and-push.yml`) builds and
+publishes this image to GitHub Container Registry on every push to `main`, as
+`ghcr.io/<owner>/sas-mcp-usecase:latest`. This is a **separate** package from the
+full-copilot server (`sas-mcp-server`), so the two never overwrite each other.
+On first publish the package is private — make it public (or give SAS Retrieval
+Agent Manager registry credentials) so RAM can pull it.
 
 ### Choosing a deployment mode
 

@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Changed
+- **Concurrency hardening for multi-user use** — token refresh in the
+  direct-HTTP server is now guarded by an `asyncio.Lock` (with a double-check)
+  so a burst of concurrent requests at token expiry can't stampede SAS Logon or
+  race a rotating refresh token.
 - **Refocused as the use-case edition — trimmed the tool set from 38 to 14.** This server is now purpose-built to be scoped to a single use case (one dataset plus its associated models/decisions) so the agent stays a reliable expert on its data instead of being overwhelmed by tools. Removed the tools that don't serve that goal: environment discovery (`list_cas_servers`, `list_caslibs`, `list_castables`), the Files service (`list_files`, `upload_file`, `download_file`), data-load/admin (`upload_data`, `promote_table_to_memory`), asynchronous batch jobs (`submit_batch_job`, `get_job_status`, `list_jobs`, `cancel_job`, `get_job_log` — `execute_sas_code` is synchronous and sufficient), Visual Analytics report viewing/authoring (`list_reports`, `get_report`, `get_report_image`, `get_report_content`, `create_report`, `update_report_content`, `validate_report_content`, `delete_report`, `create_report_from_template`, `export_report_pdf`, `get_export_job`), `explain_data`, and `list_registered_models`. The `build_va_report` prompt (which drove the removed report tools) was also removed. The full SAS Viya copilot with the complete tool surface lives in the upstream server.
 
 ### Added

@@ -23,7 +23,7 @@ def _build_server():
     return mcp, patcher
 
 
-async def test_render_chart_returns_png_image_and_metadata():
+async def test_render_chart_returns_interactive_spec():
     mcp, patcher = _build_server()
     try:
         async with Client(mcp) as client:
@@ -34,34 +34,16 @@ async def test_render_chart_returns_png_image_and_metadata():
                 "x_key": "month",
                 "y_keys": ["sales"],
             })
-        # Light structured metadata (no row-data echo).
-        meta = res.data
-        assert meta["kind"] == "chart"
-        assert meta["type"] == "bar"            # normalized to lowercase
-        assert meta["title"] == "Sales by Month"
-        assert meta["points"] == 2
-        # An actual PNG image is returned for the host to display.
-        image_blocks = [c for c in res.content if getattr(c, "type", None) == "image"]
-        assert image_blocks, "expected an image content block"
-        assert image_blocks[0].mimeType == "image/png"
-        assert image_blocks[0].data  # base64 payload present
-    finally:
-        patcher.stop()
-
-
-async def test_render_chart_renders_each_chart_type():
-    mcp, patcher = _build_server()
-    data = [{"k": "A", "v1": 10, "v2": 5}, {"k": "B", "v1": 7, "v2": 9}]
-    try:
-        async with Client(mcp) as client:
-            for ct in ("bar", "line", "area", "pie", "scatter"):
-                res = await client.call_tool("render_chart", {
-                    "chart_type": ct, "title": f"{ct} chart",
-                    "data": data, "x_key": "k", "y_keys": ["v1"],
-                })
-                image_blocks = [c for c in res.content
-                                if getattr(c, "type", None) == "image"]
-                assert image_blocks, f"{ct} produced no image"
+        # The tool returns a chart spec (tagged kind="chart") for the custom UI
+        # to render interactively — it does no server-side plotting.
+        spec = res.data
+        assert spec["kind"] == "chart"
+        assert spec["type"] == "bar"            # normalized to lowercase
+        assert spec["title"] == "Sales by Month"
+        assert spec["xKey"] == "month"
+        assert spec["yKeys"] == ["sales"]
+        assert spec["stacked"] is False
+        assert len(spec["data"]) == 2
     finally:
         patcher.stop()
 

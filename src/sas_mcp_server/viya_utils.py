@@ -16,6 +16,64 @@ logger = get_logger(__name__)
 # (seconds) — raise it for very long workloads, lower it for snappier failure.
 JOB_POLL_TIMEOUT = float(os.getenv("JOB_POLL_TIMEOUT", "3600"))
 
+# ---------------------------------------------------------------------------
+# Performance knobs
+# ---------------------------------------------------------------------------
+# These default ON because they are the difference between a ~1-2 second and a
+# ~30-second execute_sas_code call. Set to "false" only to restore the old
+# one-session/one-connection-per-call behaviour (e.g. when debugging).
+#
+# HTTP_CLIENT_POOL        — reuse one httpx client (TCP+TLS connections) per
+#                           token across tool calls instead of a fresh
+#                           handshake on every call.
+# COMPUTE_SESSION_REUSE   — keep SAS compute sessions warm between
+#                           execute_sas_code calls instead of paying the
+#                           15-45s session start-up on every call. Note that a
+#                           reused session keeps WORK datasets and macro
+#                           variables from earlier calls, like a real SAS
+#                           session.
+# COMPUTE_SESSION_POOL_MAX— how many idle sessions to keep per identity.
+# JOB_POLL_INITIAL        — first job-state poll delay; polling backs off
+#                           toward the 2s cadence so short jobs return fast.
+HTTP_CLIENT_POOL = os.getenv(
+    "HTTP_CLIENT_POOL", "true").lower() not in ("false", "0", "no")
+COMPUTE_SESSION_REUSE = os.getenv(
+    "COMPUTE_SESSION_REUSE", "true").lower() not in ("false", "0", "no")
+COMPUTE_SESSION_POOL_MAX = int(os.getenv("COMPUTE_SESSION_POOL_MAX", "3"))
+JOB_POLL_INITIAL = float(os.getenv("JOB_POLL_INITIAL", "0.25"))
+
+_client_pool = {}          # "Bearer <token>" -> httpx.AsyncClient
+_MAX_POOLED_CLIENTS = 8    # tokens rotate rarely; keeps the pool bounded
+_context_cache = {}        # (auth, context name) -> compute context id
+_session_pool = {}         # "Bearer <token>" -> [idle compute session ids]
+_session_lock = asyncio.Lock()
+
+
+def _reset_pools():
+    """Forget pooled clients, cached contexts, and idle sessions (test hook)."""
+    _client_pool.clear()
+    _context_cache.clear()
+    _session_pool.clear()
+
+
+def _normalize_token(token):
+    return token if token.startswith("Bearer ") else f"Bearer {token}"
+
+
+class _ClientLease:
+    """Async context manager that yields a pooled client and leaves it open,
+    so existing ``async with _make_client(token) as client:`` call sites keep
+    working unchanged while the underlying connections are reused."""
+
+    def __init__(self, client):
+        self._client = client
+
+    async def __aenter__(self):
+        return self._client
+
+    async def __aexit__(self, *exc):
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Generic API helpers (used by new tools)
@@ -74,11 +132,28 @@ async def _delete_resource(url, client):
 
 
 def _make_client(token):
-    """Create an httpx.AsyncClient with auth headers for Viya API calls."""
-    if not token.startswith("Bearer "):
-        token = f"Bearer {token}"
-    headers = {"Authorization": token}
-    return httpx.AsyncClient(headers=headers, verify=SSL_VERIFY, timeout=300.0)
+    """Return an async context manager yielding an authorized httpx client.
+
+    With HTTP_CLIENT_POOL on (default) the underlying client is cached per
+    token and kept open across tool calls, so repeated calls reuse pooled
+    TCP+TLS connections instead of paying a fresh handshake every time.
+    """
+    auth = _normalize_token(token)
+    headers = {"Authorization": auth}
+    if not HTTP_CLIENT_POOL:
+        return httpx.AsyncClient(headers=headers, verify=SSL_VERIFY, timeout=300.0)
+    client = _client_pool.get(auth)
+    if client is None or client.is_closed is True:
+        while len(_client_pool) >= _MAX_POOLED_CLIENTS:
+            old = _client_pool.pop(next(iter(_client_pool)))
+            try:
+                asyncio.get_running_loop().create_task(old.aclose())
+            except RuntimeError:
+                pass  # no running loop — let GC collect the old client
+        client = httpx.AsyncClient(headers=headers, verify=SSL_VERIFY,
+                                   timeout=300.0)
+        _client_pool[auth] = client
+    return _ClientLease(client)
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +257,15 @@ async def submit_job(client, session_id, code):
 
 
 async def wait_job(client, session_id, job_id, poll=2, timeout=None):
+    """Poll a job until it reaches a terminal state, then fetch log + listing.
+
+    Polling starts fast (JOB_POLL_INITIAL) and backs off toward *poll*, so a
+    sub-second PROC returns in well under a second while long jobs settle into
+    the gentle 2-second cadence.
+    """
     timeout = JOB_POLL_TIMEOUT if timeout is None else timeout
     deadline = asyncio.get_running_loop().time() + timeout
+    interval = min(JOB_POLL_INITIAL, poll)
     while True:
         state_url = f"{VIYA_ENDPOINT}/compute/sessions/{session_id}/jobs/{job_id}/state"
         resp = await client.get(state_url)
@@ -214,36 +296,102 @@ async def wait_job(client, session_id, job_id, poll=2, timeout=None):
                 f"(last state: '{state}'). Increase JOB_POLL_TIMEOUT if this "
                 f"job legitimately runs longer."
             )
-        await asyncio.sleep(poll)
+        await asyncio.sleep(interval)
+        interval = min(interval * 1.6, poll)
+
+
+async def _cached_context_id(client, auth, context_name):
+    """Resolve a compute context id once per (identity, name) and cache it —
+    the context lookup is one extra round trip on every job otherwise."""
+    key = (auth, context_name)
+    ctx_id = _context_cache.get(key)
+    if not ctx_id:
+        ctx_id = await get_context_id(client, context_name)
+        _context_cache[key] = ctx_id
+    return ctx_id
+
+
+async def _checkout_session(client, auth):
+    """Return (session_id, reused) — an idle pooled session when available,
+    otherwise a freshly created one."""
+    if COMPUTE_SESSION_REUSE:
+        async with _session_lock:
+            idle = _session_pool.get(auth)
+            if idle:
+                return idle.pop(), True
+    ctx_id = await _cached_context_id(client, auth, CONTEXT_NAME)
+    sid = await create_session(client, ctx_id, name="sas-mcp-pooled")
+    return sid, False
+
+
+async def _checkin_session(client, auth, sid):
+    """Park a healthy session for reuse, or delete it when pooling is off or
+    the pool is already full."""
+    if COMPUTE_SESSION_REUSE:
+        async with _session_lock:
+            idle = _session_pool.setdefault(auth, [])
+            if len(idle) < COMPUTE_SESSION_POOL_MAX:
+                idle.append(sid)
+                return
+    await _delete_session(client, sid)
+
+
+async def _delete_session(client, sid):
+    """Best-effort session delete — never mask the caller's real result."""
+    try:
+        await client.delete(f"{VIYA_ENDPOINT}/compute/sessions/{sid}")
+        logger.info(f"Session {sid} deleted successfully")
+    except Exception as e:
+        logger.error(f"Failed to delete session {sid}: {str(e)}")
+
+
+async def _run_in_session(client, session_id, code):
+    jid = await submit_job(client, session_id, code)
+    logger.info(f"Job submitted: {jid}")
+    result = await wait_job(client, session_id, jid)
+    logger.info(f"Job completed: {result[0]}")
+    return result
 
 
 async def run_one_snippet(snippet_data, snippet_id, token):
-    code = snippet_data
+    """Execute one SAS snippet and return (snippet_id, state, log, listing).
 
-    logger.info(f"Creating session with token (length: {len(token)})")
+    Compute sessions are pooled per identity (COMPUTE_SESSION_REUSE): session
+    creation is the dominant cost of a compute call (tens of seconds while a
+    compute server spins up), so completed sessions are parked and reused by
+    the next call instead of being deleted. A reused session that has expired
+    server-side is detected on failure and the job is retried once on a fresh
+    session.
+    """
+    code = snippet_data
+    auth = _normalize_token(token)
 
     async with _make_client(token) as client:
-        ctx_id = await get_context_id(client, CONTEXT_NAME)
-        sid = await create_session(client, ctx_id, name="py-parallel")
-        logger.info(f"Session created: {sid}")
+        sid, reused = await _checkout_session(client, auth)
+        logger.info(f"{'Reusing pooled' if reused else 'Created'} compute "
+                    f"session: {sid}")
         try:
-            jid = await submit_job(client, sid, code)
-            logger.info(f"Job submitted: {jid}")
-            result = await wait_job(client, sid, jid)
-            logger.info(f"Job completed: {result[0]}")
-            return (snippet_id, *result)
+            result = await _run_in_session(client, sid, code)
         except Exception as e:
-            logger.error(f"Error executing SAS job: {str(e)}")
-            raise e
-        finally:
+            if not reused:
+                logger.error(f"Error executing SAS job: {str(e)}")
+                await _delete_session(client, sid)
+                raise
+            # The pooled session may have timed out or died between calls —
+            # replace it and retry the job once before giving up.
+            logger.warning(f"Pooled session {sid} failed ({e}); retrying on "
+                           f"a fresh session")
+            await _delete_session(client, sid)
+            ctx_id = await _cached_context_id(client, auth, CONTEXT_NAME)
+            sid = await create_session(client, ctx_id, name="sas-mcp-pooled")
             try:
-                delete_url = f"{VIYA_ENDPOINT}/compute/sessions/{sid}"
-                await client.delete(delete_url)
-                logger.info(f"Session {sid} deleted successfully")
-            except Exception as e:
-                # Best-effort cleanup: never let a failed session delete mask
-                # the real job result or the original error from the try block.
-                logger.error(f"Failed to delete session {sid}: {str(e)}")
+                result = await _run_in_session(client, sid, code)
+            except Exception as e2:
+                logger.error(f"Error executing SAS job: {str(e2)}")
+                await _delete_session(client, sid)
+                raise
+        await _checkin_session(client, auth, sid)
+        return (snippet_id, *result)
 
 
 # ---------------------------------------------------------------------------
@@ -290,42 +438,73 @@ async def fetch_session_table_rows(client, session_id, libref, table_name,
     return col_names, rows
 
 
-async def run_query_rows(sql, token, limit=100):
-    """Run a single SQL SELECT and return the result set as structured rows.
-
-    Wraps the SELECT in ``proc sql`` (writing to ``WORK._MCPQ``) inside a fresh
-    compute session, then reads the result back through the Compute data API —
-    so it works even though each call uses a throwaway session that is deleted
-    afterwards. On success returns ``{"error": False, "columns": [...],
-    "rows": [...], "rowCount": n}``; on a SAS error returns ``{"error": True,
-    "state": ..., "log": ...}`` so the caller can correct the query.
+def _query_sas_code(statement):
+    """SAS wrapper for one SELECT: connect to CAS only when this (possibly
+    pooled/reused) compute session doesn't already have the connection — the
+    CAS connect itself costs seconds, so keeping it warm across queries is a
+    large win. ``caslib _all_ assign`` exposes CAS caslibs as SAS librefs so
+    the SELECT can reference the use-case table by its caslib-qualified name.
     """
-    statement = (sql or "").strip().rstrip(";")
-    # `caslib _all_ assign` exposes CAS caslibs as SAS librefs so the SELECT can
-    # reference the use-case table by its caslib-qualified name.
-    code = (
-        "cas _mcpcas;\n"
-        "caslib _all_ assign;\n"
+    return (
+        "%macro _mcp_cas_connect;\n"
+        "  %if %sysfunc(sessfound(_mcpcas)) ne 1 %then %do;\n"
+        "    cas _mcpcas;\n"
+        "    caslib _all_ assign;\n"
+        "  %end;\n"
+        "%mend;\n"
+        "%_mcp_cas_connect;\n"
         "proc sql;\n"
         "  create table work._mcpq as\n"
         f"  {statement};\n"
         "quit;"
     )
+
+
+async def run_query_rows(sql, token, limit=100):
+    """Run a single SQL SELECT and return the result set as structured rows.
+
+    Wraps the SELECT in ``proc sql`` (writing to ``WORK._MCPQ``) inside a
+    pooled compute session, then reads the result back through the Compute
+    data API while the session is still alive. Sessions (and their warm CAS
+    connection) are reused across queries — see ``COMPUTE_SESSION_REUSE``.
+    On success returns ``{"error": False, "columns": [...], "rows": [...],
+    "rowCount": n}``; on a SAS error returns ``{"error": True, "state": ...,
+    "log": ...}`` so the caller can correct the query.
+    """
+    statement = (sql or "").strip().rstrip(";")
+    code = _query_sas_code(statement)
+    auth = _normalize_token(token)
     async with _make_client(token) as client:
-        ctx_id = await get_context_id(client, CONTEXT_NAME)
-        sid = await create_session(client, ctx_id, name="mcp-query")
+        sid, reused = await _checkout_session(client, auth)
         try:
-            jid = await submit_job(client, sid, code)
-            state, log_text, _ = await wait_job(client, sid, jid)
-            if state not in ("completed", "warning"):
-                return {"error": True, "state": state, "log": log_text,
-                        "columns": [], "rows": []}
+            state, log_text, _ = await _run_in_session(client, sid, code)
+        except Exception as e:
+            if not reused:
+                await _delete_session(client, sid)
+                raise
+            # The pooled session may have expired between calls — retry once
+            # on a fresh session before failing (mirrors run_one_snippet).
+            logger.warning(f"Pooled session {sid} failed ({e}); retrying on "
+                           f"a fresh session")
+            await _delete_session(client, sid)
+            ctx_id = await _cached_context_id(client, auth, CONTEXT_NAME)
+            sid = await create_session(client, ctx_id, name="sas-mcp-pooled")
+            try:
+                state, log_text, _ = await _run_in_session(client, sid, code)
+            except Exception:
+                await _delete_session(client, sid)
+                raise
+        if state not in ("completed", "warning"):
+            # A SAS error (bad SQL) doesn't poison the session — keep it.
+            await _checkin_session(client, auth, sid)
+            return {"error": True, "state": state, "log": log_text,
+                    "columns": [], "rows": []}
+        try:
             cols, rows = await fetch_session_table_rows(
                 client, sid, "WORK", "_MCPQ", limit=limit)
-            return {"error": False, "state": state, "columns": cols,
-                    "rows": rows, "rowCount": len(rows)}
-        finally:
-            try:
-                await client.delete(f"{VIYA_ENDPOINT}/compute/sessions/{sid}")
-            except Exception as e:
-                logger.error(f"Failed to delete query session {sid}: {str(e)}")
+        except Exception:
+            await _delete_session(client, sid)
+            raise
+        await _checkin_session(client, auth, sid)
+        return {"error": False, "state": state, "columns": cols,
+                "rows": rows, "rowCount": len(rows)}

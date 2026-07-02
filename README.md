@@ -180,6 +180,52 @@ Entries are comma- or newline-separated and matched case-insensitively against b
 
 With none of the `ALLOWED_*` variables set, the server has full access to the environment. This makes it easy to stand up many per-use-case assistants from one image — for example, in **SAS Retrieval Agent Manager**, register the container once as a **Container MCP Server** code template, then create one tool server per use case and set these variables on its Environment Variables tab.
 
+### Example: NCGR Procurement Integrity assistant
+
+A worked configuration for a procurement-integrity use case (government
+tenders/purchase orders scored by a fraud-risk model), as used in the NCGR
+bootcamp. Set these on the RAM tool server's Environment Variables tab:
+
+```bash
+USE_CASE_NAME=Procurement Integrity
+USE_CASE_DESCRIPTION=Detects integrity risks in government procurement: analyses purchase orders and tender awards, explains red flags (split purchasing, single-bidder awards, price outliers, supplier concentration), and scores transactions in real time with the deployed procurement risk model.
+ALLOWED_TABLES=Public.PROCUREMENT_TRANSACTIONS
+ALLOWED_MODELS=procurement_risk_model
+ALLOWED_DECISIONS=procurement_risk_scoring
+SCOPE_ENFORCE=true
+```
+
+The agent then defaults every data tool to `PROCUREMENT_TRANSACTIONS`, can
+explain and chart red-flag patterns with `query_table`/`render_chart`, and can
+score a new transaction in real time with `score_data` against the deployed
+model. Pair it with a RAM collection holding the procurement legal corpus
+(e.g. the Saudi Government Tenders and Procurement Law and its Executive
+Regulations, OECD bid-rigging red-flag guidance) so answers cite the rules
+behind each flag.
+
+## Performance
+
+The dominant cost of a SAS tool call used to be **compute session start-up**
+(a compute server pod spins up per call — routinely 15–45 seconds). The server
+now pools and reuses sessions, connections, and lookups; `query_table` also
+keeps its CAS connection warm inside the pooled session. All of this is on by
+default:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `COMPUTE_SESSION_REUSE` | `true` | Keep compute sessions warm between `execute_sas_code`/`query_table` calls instead of creating + deleting one per call. A dead pooled session is detected and the job retried once on a fresh one. |
+| `COMPUTE_SESSION_POOL_MAX` | `3` | Idle sessions kept per identity. |
+| `HTTP_CLIENT_POOL` | `true` | Reuse TCP+TLS connections to Viya across tool calls (per token). |
+| `JOB_POLL_INITIAL` | `0.25` | First job-state poll delay (seconds); backs off toward 2s, so short queries return in well under a second. |
+| `JOB_POLL_TIMEOUT` | `3600` | Longest a single job is polled before giving up. |
+| `MAX_SAS_OUTPUT_CHARS` | `12000` | Caps log/listing text returned to the agent (smaller payloads = faster LLM turns). |
+
+> Note: with session reuse on, consecutive SAS calls may share a compute
+> session — like a real SAS session, `WORK` datasets and macro variables
+> persist between calls. Sessions are pooled **per identity** (per token), so
+> users never share sessions. Set `COMPUTE_SESSION_REUSE=false` to restore the
+> old one-session-per-call behaviour.
+
 ## MCP Client Configuration
 
 Example configurations are provided in the `examples/` folder. Below are quick-start snippets for common clients.

@@ -253,7 +253,10 @@ async def test_run_one_snippet_success(sample_sas_code, mock_access_token, mock_
     """Test successful execution of a SAS code snippet."""
     with patch('sas_mcp_server.viya_utils.httpx.AsyncClient') as mock_client_class:
         mock_client = AsyncMock()
-        mock_client_class.return_value.__aenter__.return_value = mock_client
+        # Works with both the pooled path (client used directly) and the
+        # legacy per-call path (client used as an async context manager).
+        mock_client.__aenter__.return_value = mock_client
+        mock_client_class.return_value = mock_client
         
         # Mock all the API calls
         mock_context_response = AsyncMock()
@@ -300,7 +303,10 @@ async def test_run_one_snippet_with_bearer_prefix(sample_sas_code, mock_env_vars
     
     with patch('sas_mcp_server.viya_utils.httpx.AsyncClient') as mock_client_class:
         mock_client = AsyncMock()
-        mock_client_class.return_value.__aenter__.return_value = mock_client
+        # Works with both the pooled path (client used directly) and the
+        # legacy per-call path (client used as an async context manager).
+        mock_client.__aenter__.return_value = mock_client
+        mock_client_class.return_value = mock_client
         
         # Mock minimal responses for the test
         mock_context_response = AsyncMock()
@@ -370,7 +376,10 @@ async def test_run_query_rows_success(mock_access_token, mock_env_vars):
     """run_query_rows wraps the SELECT, runs it, and returns structured rows."""
     with patch('sas_mcp_server.viya_utils.httpx.AsyncClient') as mock_client_class:
         mock_client = AsyncMock()
-        mock_client_class.return_value.__aenter__.return_value = mock_client
+        # Works with both the pooled path (client used directly) and the
+        # legacy per-call path (client used as an async context manager).
+        mock_client.__aenter__.return_value = mock_client
+        mock_client_class.return_value = mock_client
 
         def _resp(json_data=None, text=None):
             r = AsyncMock()
@@ -416,7 +425,10 @@ async def test_run_query_rows_error_returns_log(mock_access_token, mock_env_vars
     """A SAS error returns the log instead of rows so the caller can correct it."""
     with patch('sas_mcp_server.viya_utils.httpx.AsyncClient') as mock_client_class:
         mock_client = AsyncMock()
-        mock_client_class.return_value.__aenter__.return_value = mock_client
+        # Works with both the pooled path (client used directly) and the
+        # legacy per-call path (client used as an async context manager).
+        mock_client.__aenter__.return_value = mock_client
+        mock_client_class.return_value = mock_client
 
         def _resp(json_data=None, text=None):
             r = AsyncMock()

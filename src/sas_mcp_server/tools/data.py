@@ -34,7 +34,7 @@ def _not_found(caslib: str, name: str) -> dict[str, Any]:
 def scope_query(query: str, scope: UseCaseScope) -> tuple[str, dict[str, Any] | None]:
     """Qualify bare table names and refuse out-of-scope ones.
 
-    A bare name that matches an allowed table (``from PATIENTS``) is rewritten
+    A bare name that matches an allowed table (``from MYTABLE``) is rewritten
     to its caslib-qualified form, so the agent need not remember the caslib.
     A qualified name outside the allowlist is refused when the scope is
     enforced. Other bare names are left alone: they may be a function's

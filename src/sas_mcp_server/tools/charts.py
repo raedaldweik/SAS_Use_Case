@@ -87,7 +87,7 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]], scope
         Args:
             chart_type: One of bar, line, area, pie, scatter.
             title: Chart title.
-            data: List of row objects, e.g. [{"month": "Jan", "patients": 120}, ...].
+            data: List of row objects, e.g. [{"month": "Jan", "count": 120}, ...].
             x_key: Field for the x-axis / category (for pie, the slice label).
             y_keys: Field(s) plotted as series / values (for pie or scatter, one or two).
             subtitle: Optional subtitle.

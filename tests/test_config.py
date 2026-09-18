@@ -13,17 +13,20 @@ state. Accumulating orphans across multiple tests in the same pytest session
 corrupts the event-loop-bound httpx state used by later integration tests,
 producing empty-message ``httpcore.ConnectError``s on real Viya calls.
 """
+
 import importlib
 import sys
-import pytest
 from unittest.mock import patch
+
+import pytest
 
 
 def _reload_config():
     """Reload sas_mcp_server.config in place. Imports first if not yet loaded."""
-    if 'sas_mcp_server.config' in sys.modules:
-        return importlib.reload(sys.modules['sas_mcp_server.config'])
+    if "sas_mcp_server.config" in sys.modules:
+        return importlib.reload(sys.modules["sas_mcp_server.config"])
     import sas_mcp_server.config as cfg
+
     return cfg
 
 
@@ -57,9 +60,8 @@ def test_config_missing_viya_endpoint(monkeypatch):
     monkeypatch.delenv("VIYA_ENDPOINT", raising=False)
     monkeypatch.setenv("CLIENT_ID", "test-client")
     # Block module-level load_dotenv from reloading VIYA_ENDPOINT from .env.
-    with patch('dotenv.load_dotenv'):
-        with pytest.raises(Exception, match="VIYA_ENDPOINT is not set"):
-            _reload_config()
+    with patch("dotenv.load_dotenv"), pytest.raises(Exception, match="VIYA_ENDPOINT is not set"):
+        _reload_config()
     # Restore a valid module state for subsequent tests in the session, since
     # the failed reload leaves the module in a partially-initialised state.
     # Set the endpoint explicitly so the restore succeeds regardless of whether
@@ -77,7 +79,7 @@ def test_config_default_values(monkeypatch):
     monkeypatch.delenv("MCP_SIGNING_KEY", raising=False)
     monkeypatch.delenv("COMPUTE_CONTEXT_NAME", raising=False)
     # Block module-level load_dotenv from repopulating from .env.
-    with patch('dotenv.load_dotenv'):
+    with patch("dotenv.load_dotenv"):
         cfg = _reload_config()
     assert cfg.CLIENT_ID == "sas-mcp"
     assert cfg.HOST_PORT == 8134

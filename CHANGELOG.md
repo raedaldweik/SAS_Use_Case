@@ -1,5 +1,58 @@
 # Changelog
 
+## [2.0.0] - 2026-09-18
+
+The use-case edition rebuilt on the upstream 1.15.0 internals, with the tool surface cut to what a
+dataset-plus-model agent (for example a SAS Retrieval Agent Manager agent) actually uses.
+
+### Changed
+- **Eight tools instead of fourteen.** `get_use_case`, `describe_table`, `preview_table`, `query_data`,
+  `render_chart`, `list_models`, `describe_model`, `score_data`. The data tools take one `table`
+  argument (`caslib.table`) and default to the primary `ALLOWED_TABLES` entry.
+- **`query_data` replaces `query_table`.** Ported from upstream: FedSQL instead of PROC SQL, a pre-flight
+  screen (single read-only `SELECT`, no macro triggers, balanced quotes), a server-side row cap with a
+  `truncated` flag, rows read from a format-stripped copy (numbers stay numeric, dates become ISO text,
+  missings are `null`), and SAS log errors mapped to a status dict (`table_not_found`,
+  `column_not_found`, `syntax_error`, …) whose message names the fix. New here: bare table names are
+  qualified against `ALLOWED_TABLES`, and qualified names outside it are refused (`out_of_scope`).
+- **Warm compute sessions.** Queries run in a per-user cached compute session (ported from upstream)
+  instead of a fresh session per call, so a query takes about a second. Because the headless modes share
+  one service-account token across all chat users, a per-session job lock serialises their jobs; a job
+  that overruns `JOB_POLL_TIMEOUT` (now 600 s) is abandoned and its session discarded.
+- **`score_data` takes the model by id or name** and no longer needs `step_id`: it lists the module's
+  steps and prefers `score` (models) over `execute` (decisions). Inputs are matched to the step's
+  declared variables case-insensitively and converted to their types; extra keys are ignored and
+  missing ones reported (`ignoredInputs` / `missingInputs`), so a `query_data` row can be passed as-is.
+  A list of records scores them all in one call (`MAX_SCORE_RECORDS`, default 100). Outputs come back as
+  `{name: value}`.
+- **`list_models` replaces `list_models_and_decisions`** and also reports `unavailable`: allowed models
+  that are not published to MAS yet — the usual reason a bootcamp model "does not work".
+- **`get_use_case` now grounds the agent fully**: primary table with columns *and* row count, every
+  allowed model with its scoring signature, and short usage guidance.
+- **Viya errors are readable.** HTTP failures quote Viya's own message (`HTTP 404 from GET /… — Viya
+  reported: …`) instead of a bare status code (upstream `raise_for_viya_status`).
+- **FastMCP 4** (from 3.2). `SSL_VERIFY=false` now patches httpx2 as well, so it still covers FastMCP's own
+  OAuth/JWKS calls (upstream `ssl_patch`). The OAuth proxy sends no client password for the public
+  `sas-mcp` client (`token_endpoint_auth_method="none"`) and disables CIMD so loopback-port clients can
+  sign in.
+- **The server says which version it is** in the log and the MCP handshake; `MCP_SERVER_NAME` sets the
+  advertised name.
+- **Every tool carries MCP tool annotations** (`readOnlyHint` etc.); only `score_data` is not read-only.
+- **Prompts** replaced by two use-case workflows: `explore_use_case` and `score_and_explain`.
+- **Packaging.** Distribution renamed `sas-mcp-usecase` (import name unchanged: `sas_mcp_server`).
+  The Docker image installs the *locked* dependency set with hash verification and carries OCI labels
+  linking the GHCR package to this repository. The publish workflow builds amd64 + arm64 and tags
+  `:latest`, `:<version>`, `:sha-<commit>` (plus semver tags on a `v*` tag) on pushes to `main`, `v*` tags,
+  and manual runs from any branch. A CI workflow runs lint, unit tests and a wheel build.
+- Source split into `helpers/` (CAS, MAS, FedSQL) and `tools/` (grounding, data, scoring, charts).
+
+### Removed
+- `execute_sas_code` (arbitrary SAS code is not something a scoped agent should run as a shared service
+  account), the AutoML tools (`list_ml_projects`, `create_ml_project`, `run_ml_project`,
+  `get_ml_project_results`, `delete_ml_project` — models are built in Model Studio), `get_castable_info`
+  / `get_castable_columns` / `get_castable_data` (folded into `describe_table` / `preview_table`),
+  `ALLOWED_REPORTS`, `MAX_SAS_OUTPUT_CHARS`, and the SAS-code prompt templates.
+
 ## [Unreleased]
 
 ### Changed

@@ -1,15 +1,14 @@
 # Copyright © 2025, SAS Institute Inc., Cary, NC, USA.  All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Use-case scoping for the SAS MCP server.
+"""Use-case scoping for the SAS MCP server.
 
-A "use case" restricts the assistant to a curated subset of the SAS Viya
-environment — specific CAS tables, models, and decisions — instead of exposing
-everything. The scope is defined entirely through environment variables, so a
-non-developer can configure a per-use-case chatbot (for example, from the SAS
-Retrieval Agent Manager tool-server Environment Variables tab) without touching
-code.
+A "use case" pins the assistant to one dataset (plus any related tables) and
+the ready models it may score against, instead of exposing everything in the
+SAS Viya environment. The scope is defined entirely through environment
+variables, so a non-developer can configure a per-use-case agent — for example
+from the SAS Retrieval Agent Manager tool-server Environment Variables tab —
+without touching code.
 
 Environment variables
 ----------------------
@@ -17,31 +16,30 @@ Environment variables
 ``USE_CASE_DESCRIPTION``  What the assistant is for.
 ``ALLOWED_TABLES``        Comma/newline-separated CAS tables. Each entry may be
                           ``table``, ``caslib.table``, or
-                          ``server.caslib.table``. The first entry is treated as
-                          the *primary* table and is what the data tools default
-                          to when called without an explicit table.
-``ALLOWED_REPORTS``       Comma/newline-separated report IDs or names.
-``ALLOWED_MODELS``        Comma/newline-separated model IDs or names.
-``ALLOWED_DECISIONS``     Comma/newline-separated decision/MAS-module IDs or names.
-``DEFAULT_CAS_SERVER``    CAS server used when a table entry omits the server
+                          ``server.caslib.table``. The first entry is the
+                          *primary* table the data tools default to.
+``ALLOWED_MODELS``        Comma/newline-separated MAS module ids or names the
+                          assistant may score against (published models).
+``ALLOWED_DECISIONS``     Same, for published decisions. Kept separate only for
+                          readability — both feed one scoring allowlist.
+``DEFAULT_CAS_SERVER``    CAS server used when a table entry omits it
                           (default ``cas-shared-default``).
-``DEFAULT_CASLIB``        Caslib used when a table entry omits the caslib
+``DEFAULT_CASLIB``        Caslib used when a table entry omits it
                           (default ``Public``).
 ``SCOPE_ENFORCE``         ``true`` (default) blocks access to out-of-scope
                           resources; ``false`` only hides them from listings.
 
-If none of the ``ALLOWED_*`` variables are set, the scope is inactive and the
-server behaves exactly as before — full access to the environment.
+With none of the ``ALLOWED_*`` variables set, the scope is inactive and the
+server has full access to the environment.
 """
 
 import os
-from typing import Optional
 
 DEFAULT_CAS_SERVER = "cas-shared-default"
 DEFAULT_CASLIB = "Public"
 
 
-def _parse_list(raw: Optional[str]) -> list:
+def _parse_list(raw: str | None) -> list[str]:
     """Split a comma/newline-separated env value into a clean list."""
     if not raw:
         return []
@@ -53,55 +51,56 @@ def _parse_list(raw: Optional[str]) -> list:
     return out
 
 
-def _norm(value) -> str:
+def _norm(value: object) -> str:
     return str(value).strip().lower()
+
+
+def parse_table_spec(entry: str, default_server: str, default_caslib: str) -> dict[str, str]:
+    """Split ``server.caslib.table`` / ``caslib.table`` / ``table`` into parts."""
+    parts = [p.strip().strip('"') for p in str(entry).split(".") if p.strip()]
+    if len(parts) >= 3:
+        return {"server": parts[0], "caslib": parts[1], "table": parts[2]}
+    if len(parts) == 2:
+        return {"server": default_server, "caslib": parts[0], "table": parts[1]}
+    if len(parts) == 1:
+        return {"server": default_server, "caslib": default_caslib, "table": parts[0]}
+    return {"server": default_server, "caslib": default_caslib, "table": ""}
 
 
 class UseCaseScope:
     """An allowlist of the resources a scoped assistant may use."""
 
-    def __init__(self, name="", description="", tables=None, reports=None,
-                 models=None, decisions=None, enforce=True,
-                 default_server=DEFAULT_CAS_SERVER,
-                 default_caslib=DEFAULT_CASLIB):
+    def __init__(
+        self,
+        name: str = "",
+        description: str = "",
+        tables=None,
+        models=None,
+        decisions=None,
+        enforce: bool = True,
+        default_server: str = DEFAULT_CAS_SERVER,
+        default_caslib: str = DEFAULT_CASLIB,
+    ) -> None:
         self.name = name
         self.description = description
         self.tables = list(tables or [])
-        self.reports = list(reports or [])
         self.models = list(models or [])
         self.decisions = list(decisions or [])
         self.enforce = enforce
         self.default_server = default_server or DEFAULT_CAS_SERVER
         self.default_caslib = default_caslib or DEFAULT_CASLIB
         self._tables = {_norm(t) for t in self.tables}
-        self._reports = {_norm(r) for r in self.reports}
-        self._models = {_norm(m) for m in self.models}
-        self._decisions = {_norm(d) for d in self.decisions}
+        self._scoreables = {_norm(m) for m in self.models} | {_norm(d) for d in self.decisions}
         # Parse each table entry into {server, caslib, table} so the data tools
-        # can default to the pinned table without the agent juggling identifiers.
-        self.table_specs = [
-            self._parse_table_spec(t, self.default_server, self.default_caslib)
-            for t in self.tables
-        ]
+        # can default to the pinned table without the agent juggling names.
+        self.table_specs = [parse_table_spec(t, self.default_server, self.default_caslib) for t in self.tables]
 
-    @staticmethod
-    def _parse_table_spec(entry, default_server, default_caslib) -> dict:
-        """Split ``server.caslib.table`` / ``caslib.table`` / ``table`` into parts."""
-        parts = [p.strip() for p in str(entry).split(".") if p.strip()]
-        if len(parts) >= 3:
-            return {"server": parts[0], "caslib": parts[1], "table": parts[2]}
-        if len(parts) == 2:
-            return {"server": default_server, "caslib": parts[0], "table": parts[1]}
-        if len(parts) == 1:
-            return {"server": default_server, "caslib": default_caslib,
-                    "table": parts[0]}
-        return {"server": default_server, "caslib": default_caslib, "table": ""}
+    # -- what is in scope ----------------------------------------------------
 
     @property
     def active(self) -> bool:
         """True when at least one allowlist is defined."""
-        return bool(self._tables or self._reports or self._models
-                    or self._decisions)
+        return bool(self._tables or self._scoreables)
 
     @property
     def enforced(self) -> bool:
@@ -109,17 +108,27 @@ class UseCaseScope:
         return self.active and self.enforce
 
     @property
-    def primary_table(self) -> Optional[dict]:
+    def primary_table(self) -> dict[str, str] | None:
         """The first allowed table as ``{server, caslib, table}`` (or None)."""
         return self.table_specs[0] if self.table_specs else None
 
-    def resolve(self, server=None, caslib=None, table=None):
+    @property
+    def scoreables(self) -> list[str]:
+        """Every allowed model/decision entry, models first."""
+        return self.models + self.decisions
+
+    @property
+    def qualified_tables(self) -> list[str]:
+        """The allowed tables as ``caslib.table`` names."""
+        return [f"{s['caslib']}.{s['table']}" for s in self.table_specs if s["table"]]
+
+    # -- resolution -----------------------------------------------------------
+
+    def resolve(self, server=None, caslib=None, table=None) -> tuple[str, str, str | None]:
         """Fill in missing CAS table coordinates from the primary scoped table.
 
         Explicit arguments always win; anything left as ``None`` is taken from
-        the primary allowed table, then from the configured defaults. This lets
-        the data tools be called with no arguments and still act on the pinned
-        use-case table.
+        the primary allowed table, then from the configured defaults.
         """
         primary = self.primary_table or {}
         table = table or primary.get("table")
@@ -127,30 +136,34 @@ class UseCaseScope:
         server = server or primary.get("server") or self.default_server
         return server, caslib, table
 
-    @staticmethod
-    def _match(allowed: set, *candidates) -> bool:
-        return any(c is not None and _norm(c) in allowed for c in candidates)
+    def resolve_spec(self, table: str | None) -> tuple[str, str, str | None]:
+        """Resolve one ``[server.][caslib.]table`` string (or None → primary)."""
+        if not table or not str(table).strip():
+            return self.resolve()
+        spec = parse_table_spec(table, "", "")
+        return self.resolve(spec["server"] or None, spec["caslib"] or None, spec["table"] or None)
+
+    def find_table(self, name: str) -> dict[str, str] | None:
+        """The allowed table spec whose bare name matches *name* (case-insensitive)."""
+        wanted = _norm(name)
+        for spec in self.table_specs:
+            if _norm(spec["table"]) == wanted:
+                return spec
+        return None
 
     # -- membership checks (an empty allowlist for a kind permits everything) --
 
-    def allows_report(self, *candidates) -> bool:
-        return not self._reports or self._match(self._reports, *candidates)
-
-    def allows_model(self, *candidates) -> bool:
-        return not self._models or self._match(self._models, *candidates)
-
-    def allows_decision(self, *candidates) -> bool:
-        return not self._decisions or self._match(self._decisions, *candidates)
+    @staticmethod
+    def _match(allowed: set[str], *candidates) -> bool:
+        return any(c is not None and _norm(c) in allowed for c in candidates)
 
     def allows_scoreable(self, *candidates) -> bool:
         """Whether a MAS module (model *or* decision) may be scored.
 
-        Checks the union of the models and decisions allowlists. When neither is
-        set, every module is permitted; otherwise a module must appear in one of
-        them (so setting only ALLOWED_DECISIONS still restricts scoring).
+        When neither allowlist is set every module is permitted; otherwise the
+        module's id or name must appear in one of them.
         """
-        combined = self._models | self._decisions
-        return not combined or self._match(combined, *candidates)
+        return not self._scoreables or self._match(self._scoreables, *candidates)
 
     def allows_table(self, name=None, caslib=None, server=None) -> bool:
         if not self._tables:
@@ -162,6 +175,8 @@ class UseCaseScope:
             candidates.append(f"{server}.{caslib}.{name}")
         return self._match(self._tables, *candidates)
 
+    # -- for the agent --------------------------------------------------------
+
     def manifest(self) -> dict:
         """A description of the scope suitable for returning to the agent."""
         return {
@@ -169,10 +184,8 @@ class UseCaseScope:
             "description": self.description,
             "scoped": self.active,
             "enforced": self.enforced,
-            "allowedTables": self.tables,
-            "allowedReports": self.reports,
-            "allowedModels": self.models,
-            "allowedDecisions": self.decisions,
+            "allowedTables": self.qualified_tables,
+            "allowedModels": self.scoreables,
             "defaultServer": self.default_server,
             "defaultCaslib": self.default_caslib,
             "primaryTable": self.primary_table,
@@ -186,7 +199,6 @@ def load_scope() -> UseCaseScope:
         name=os.getenv("USE_CASE_NAME", ""),
         description=os.getenv("USE_CASE_DESCRIPTION", ""),
         tables=_parse_list(os.getenv("ALLOWED_TABLES", "")),
-        reports=_parse_list(os.getenv("ALLOWED_REPORTS", "")),
         models=_parse_list(os.getenv("ALLOWED_MODELS", "")),
         decisions=_parse_list(os.getenv("ALLOWED_DECISIONS", "")),
         enforce=enforce,

@@ -1,322 +1,187 @@
 # SAS MCP Server — Use-Case Edition
 
-A Model Context Protocol (MCP) server that turns a single SAS Viya dataset (plus
-its associated models and decisions) into a focused analytics assistant. Point
-it at your data with a few environment variables and the agent becomes an expert
-on that dataset — querying it, charting it, scoring against ready models, and
-building new ones — without being distracted by the rest of the environment.
+A small [Model Context Protocol](https://modelcontextprotocol.io) server that turns **one SAS Viya
+dataset and its ready models** into a focused analytics agent. Point it at your data and models with
+a few environment variables and an agent (for example one built in **SAS Retrieval Agent Manager**)
+can query the data, score records against the models in real time, and chart the results — and
+nothing else.
 
-> This is the **use-case-scoped** edition with a small, purpose-built tool set.
-> For the full SAS Viya copilot (the complete tool surface), use the upstream
-> SAS MCP server.
+It is the use-case-scoped sibling of the full
+[sassoftware/sas-mcp-server](https://github.com/sassoftware/sas-mcp-server) (92 tools). The plumbing is
+ported from there (FedSQL querying, warm compute sessions, readable Viya errors, FastMCP 4); the tool
+surface is cut down to the eight tools such an agent needs.
 
-## Features
+## The tools
 
-- Query a scoped dataset with SAS or SQL and get back structured rows
-- Render interactive charts from query results
-- Score records in real time against ready models and decisions
-- Build ML models with AutoML and read back their performance
-- OAuth2 authentication with PKCE flow (plus headless refresh-token / direct modes)
-- HTTP-based MCP server compatible with MCP clients
+| Tool | What it does |
+|---|---|
+| **get_use_case** | Call first. Reports the use case: the primary table with its columns and row count, and the ready models with their input/output signatures. Grounds the agent in one call. |
+| **describe_table** | Row count, column count and every column's name/type/label/format. Defaults to the use-case table. |
+| **preview_table** | A page of raw rows, formatted as SAS displays them. |
+| **query_data** | A FedSQL `SELECT` over the use-case table(s) returning JSON rows — counts, averages, group-bys, top-N, joins. Bare table names are qualified for you; only a single read-only `SELECT` is accepted; rows are capped server-side. Errors come back as a status dict that names the fix. |
+| **render_chart** | Emits an interactive chart spec (`kind: "chart"`; bar/line/area/pie/scatter) from rows you already have — the chat front-end draws it. |
+| **list_models** | The published models/decisions the agent may score against, and any allowed ones that are not published yet. |
+| **describe_model** | The scoring step and its typed inputs and outputs. |
+| **score_data** | Real-time scoring of one record or a list of records against a ready model (SAS Micro Analytic Service). Accepts the model's id **or name**, picks the step (`score`/`execute`) itself, matches input names case-insensitively, converts types, ignores extra keys and reports missing ones — so a `query_data` row can be passed straight in. |
 
-## Getting Started
+Two MCP prompts (`explore_use_case`, `score_and_explain`) chain the tools for clients that support them.
+
+## Quick start for a SAS Retrieval Agent Manager agent
+
+The published image is
+
+```
+ghcr.io/raedaldweik/sas-mcp-usecase:latest
+```
+
+(also tagged `:2.0.0` and `:sha-<commit>`; see [Publishing](#publishing)). On first publish a GHCR package
+is private — make it public, or give RAM registry credentials, so RAM can pull it.
+
+1. **Data on SAS.** Load your dataset into CAS as a global (promoted) table, for example
+   `Public.PATIENTS`.
+2. **Model on SAS.** Build the model (Model Studio / Model Manager) and **publish it to SAS Micro
+   Analytic Service (MAS)**. Note the published name — that is the module the agent scores with.
+3. **Tool server in RAM.** Add a Container MCP server from the image above (or run the container
+   anywhere and add a *Remote MCP server* with transport *Streamable HTTP*, URL `http://<host>:8134/mcp`,
+   authentication *API Key*). Set these environment variables on it:
+
+   | Variable | Example |
+   |---|---|
+   | `VIYA_ENDPOINT` | `https://viya.example.com` |
+   | `VIYA_REFRESH_TOKEN` (secret) — or `VIYA_USERNAME` + `VIYA_PASSWORD` for non-SSO accounts | see [headless auth](examples/configuration.md#headless-authentication-for-sso-and-federated-environments) |
+   | `MCP_API_KEY` (secret) | a long random string; the same key goes on the RAM side |
+   | `USE_CASE_NAME` | `Population Health` |
+   | `USE_CASE_DESCRIPTION` | `Answers questions about the patient cohort and predicts 30-day readmission risk.` |
+   | `ALLOWED_TABLES` | `Public.PATIENTS` |
+   | `ALLOWED_MODELS` | `Readmission_GB` |
+   | `SSL_VERIFY` | `false` only for a self-signed Viya certificate |
+
+4. **Agent.** Attach the tool server to your agent. A good system prompt starts with "Call
+   `get_use_case` first" — after that the agent knows the table, the columns and the model inputs.
+
+Try: *"How many patients over 65 by region? Chart it."* → *"What is the readmission risk for patient
+1042?"* (the agent queries the row, then scores it) → *"Score a 71-year-old with 3 prior admissions."*
+
+One image serves many use cases: register it once and create one tool server per use case, each with
+its own variables.
+
+## Running it yourself
+
 ### Prerequisites
-- Required
-    - [Python 3.12+](https://www.python.org/downloads) 
-    - [uv 0.8+](https://github.com/astral-sh/uv)  
-    - [SAS Viya environment](https://www.sas.com/en_us/software/viya.html) with compute service
-    - Setup the Viya environment for MCP
-        - See [configuration.md](/examples/configuration.md)
+- [Python 3.12+](https://www.python.org/downloads) and [uv 0.8+](https://github.com/astral-sh/uv)
+- A SAS Viya environment with the Compute service, and the one-time
+  [Viya setup](examples/configuration.md) (OAuth client registration)
+- Optional: Docker / Podman
 
-- Optional
-    - [Docker](https://docs.docker.com/engine/install): refer to [docker setup](/examples/docker/setup.md)
+### Install and configure
 
-### Installation
-
-1. Clone the repository:
 ```sh
-git clone <repository-url>
-cd sas-mcp-server
-```
-
-2. Install dependencies
-```sh
+git clone https://github.com/raedaldweik/SAS_Use_Case.git
+cd SAS_Use_Case
 uv sync
+cp .env.sample .env      # set VIYA_ENDPOINT, the use case, and credentials
 ```
 
-NOTE: This will by default create a virtual environment called .venv in the project's root directory. 
+### Modes
 
-If for some reason the virtual environment is not created, please run `uv venv` and then re-run `uv sync`.
+| | **Direct HTTP** (RAM, server-to-server) | **HTTP** (per-user OAuth) | **Stdio** |
+|---|---|---|---|
+| Start | `uv run app-http-direct` | `uv run app` | client runs `uv run app-stdio` |
+| Auth to Viya | Refresh token or password from `.env`; optional `MCP_API_KEY` on the endpoint | Each user signs in in the browser (PKCE) | Refresh token or password from `.env` |
+| Endpoint | `http://host:8134/mcp` (or `/sse` with `MCP_TRANSPORT=sse`) | `http://localhost:8134/mcp` | — |
+| Use it for | SAS RAM and other clients that cannot do browser OAuth | Shared multi-user deployments | Local development, Gemini CLI |
 
-### Usage
+**Docker**
 
-1. Configure environment variables:
-```sh
-cp .env.sample .env
-```
-
-Edit `.env` and set
-```sh
-VIYA_ENDPOINT=https://your-viya-server.com
-```
-
-2. Start the MCP server (see [Choosing a deployment mode](#choosing-a-deployment-mode) below):
-
-**Option A: HTTP mode** (pre-run the server, connect from MCP client)
-```sh
-uv run app
-```
-The server will be available at `http://localhost:8134/mcp` by default. Authentication is handled via OAuth2 PKCE flow in the browser.
-
-**Option B: Stdio mode** (MCP client starts the server on demand)
-
-Set `VIYA_USERNAME` and `VIYA_PASSWORD` in your `.env` file, then configure your MCP client to launch the server directly (see below). For **SSO/federated environments (e.g. Okta)** the password grant does not work — set `VIYA_REFRESH_TOKEN` instead (see [Headless authentication for SSO environments](examples/configuration.md#headless-authentication-for-sso-and-federated-environments)).
-
-**Option C: Direct HTTP mode** (long-running server, no browser OAuth — for server-to-server MCP clients such as SAS Retrieval Agent Manager)
-
-Set `VIYA_USERNAME` and `VIYA_PASSWORD` — or, for SSO/federated environments and unattended 24/7 use, `VIYA_REFRESH_TOKEN` (see [Headless authentication for SSO environments](examples/configuration.md#headless-authentication-for-sso-and-federated-environments)) — (and optionally `MCP_API_KEY`) in your `.env` file, then:
-```sh
-uv run app-http-direct
-```
-The server authenticates to Viya itself with the `.env` credentials and serves streamable HTTP at `http://host:8134/mcp` (or SSE at `http://host:8134/sse` with `MCP_TRANSPORT=sse`). If `MCP_API_KEY` is set, clients must send it as an `X-API-Key` header or `Authorization: Bearer` token.
-
-**Option D: Docker / Podman** (containerized deployment)
 ```sh
 docker build -t sas-mcp-usecase .
-docker run -e VIYA_ENDPOINT=https://your-viya-server.com -p 8134:8134 sas-mcp-usecase
+docker run --env-file .env -p 8134:8134 sas-mcp-usecase
 ```
 
-A GitHub Actions workflow (`.github/workflows/build-and-push.yml`) builds and
-publishes this image to GitHub Container Registry on every push to `main`, as
-`ghcr.io/<owner>/sas-mcp-usecase:latest`. This is a **separate** package from the
-full-copilot server (`sas-mcp-server`), so the two never overwrite each other.
-On first publish the package is private — make it public (or give SAS Retrieval
-Agent Manager registry credentials) so RAM can pull it.
+The container defaults to direct HTTP mode (`MCP_MODE=http-direct`); set `MCP_MODE=http` or `stdio`
+to change it. `GET /health` is always open for probes.
 
-### Choosing a deployment mode
+**Client snippets** for VS Code / Cursor / Claude Code, Claude Desktop and Gemini CLI are in
+[`examples/`](examples/) — for example `.vscode/mcp.json`:
 
-| | **HTTP** | **Stdio** | **Direct HTTP** | **Docker** |
-|---|---|---|---|---|
-| **How it runs** | Long-running server you start separately | MCP client spawns it on demand | Long-running server you start separately | Containerized HTTP server |
-| **Authentication** | OAuth2 PKCE flow (browser popup) | Password grant, or refresh token for SSO (in `.env`) | Password grant, or refresh token for SSO (in `.env`); optional API key on the endpoint | OAuth2 PKCE flow (browser popup) |
-| **Best for** | Multi-user or shared setups; production-like environments | Single-user local development; quick experimentation | Server-to-server MCP clients that cannot do browser OAuth (e.g. SAS Retrieval Agent Manager) | Team deployments; CI/CD; environments without Python installed |
-| **Requires** | Python + uv | Python + uv | Python + uv | Docker or Podman only |
-| **Credentials stored?** | No — user authenticates interactively | Yes — username/password or refresh token in `.env` | Yes — username/password or refresh token in `.env` | No — user authenticates interactively |
-| **MCP client config** | Point client to `http://localhost:8134/mcp` | Client runs `uv run app-stdio` | Point client to `http://host:8134/mcp` (+ API key if set) | Point client to `http://host:8134/mcp` |
+```json
+{ "servers": { "sas-usecase": { "url": "http://localhost:8134/mcp", "type": "http" } } }
+```
 
-**Quick guidance:**
-- **Starting out or exploring?** Use **stdio** — zero setup beyond `.env`, and your MCP client manages the server lifecycle.
-- **Need secure, interactive auth?** Use **HTTP** — no stored passwords, each user authenticates via browser.
-- **Deploying for a team or on a server?** Use **Docker** — portable, no Python dependency on the host, easy to integrate with orchestrators.
-- **Using Gemini CLI?** Use **stdio** — Gemini CLI does not support HTTP mode or browser-based OAuth. See [Gemini CLI configuration](examples/configuration.md#gemini-cli).
-- **Connecting from SAS Retrieval Agent Manager (RAM)?** Use **direct HTTP** — in RAM, add a *Remote MCP server* with transport *Streamable HTTP*, URL `http://<host>:8134/mcp`, and authentication *API Key* (matching `MCP_API_KEY`) or *None*. If your Viya uses **SSO/Okta**, authenticate the server to Viya with `VIYA_REFRESH_TOKEN` (set it as a secret on the tool server's Environment Variables tab) rather than a username/password — see [Headless authentication for SSO environments](examples/configuration.md#headless-authentication-for-sso-and-federated-environments).
+## Configuration
 
-### Available Tools
-
-This server is intentionally focused on a single use case (one dataset plus its
-associated models/decisions), so it exposes a small, purpose-built tool set —
-**14 tools** — rather than the full SAS Viya surface. A focused tool set keeps
-the agent a reliable expert on its data instead of overwhelming it with choices.
-The data tools default to the use-case table, so you rarely pass table names.
-
-#### Use case & grounding
-- **get_use_case**: Report the use case — the primary dataset (with its columns), and the models/decisions this assistant may use. Call this first.
-
-#### Querying & code execution
-- **execute_sas_code**: Execute arbitrary SAS code and retrieve the log and listing (data prep, PROC-based modelling, assessment, any SAS step)
-- **query_table**: Run a SQL SELECT and get back **structured rows** (columns + rows) — the right tool for "top N…" questions you then want to chart
-- **get_castable_info**: Get table metadata (row count, columns, size) for the use-case table
-- **get_castable_columns**: Get column names, types, labels, formats for the use-case table
-- **get_castable_data**: Fetch raw sample rows from the use-case table
-
-#### Visualization
-- **render_chart**: Emit an interactive chart spec (bar/line/area/pie/scatter, tagged `kind:"chart"`) that the custom Roads RAM UI renders as an interactive chart — pair it with `query_table`
-
-#### Ready models & decisions (real-time scoring)
-- **list_models_and_decisions**: List the ready (published) models and decisions you can score against (MAS modules)
-- **score_data**: Score a record against a ready model or decision in real time
-
-#### Model building (AutoML)
-- **list_ml_projects**: List AutoML pipeline automation projects
-- **create_ml_project**: Build a new ML model with AutoML
-- **run_ml_project**: Run (train) an AutoML project
-- **get_ml_project_results**: Get an AutoML project's state, champion model, and leaderboard with fit statistics
-- **delete_ml_project**: Delete an AutoML project
-
-### Prompt Templates
-
-- **debug_sas_log**: Analyze SAS log for errors with root-cause explanations
-- **explore_dataset**: Generate data-profiling SAS code
-- **data_quality_check**: Generate DQ assessment code
-- **statistical_analysis**: Set up a statistical workflow with diagnostics
-- **optimize_sas_code**: Review and optimize SAS code
-- **explain_sas_code**: Block-by-block code explanation
-- **sas_macro_builder**: Build production-quality SAS macros
-- **generate_report**: Generate ODS/PROC REPORT code
-
-## Use-Case Scoping
-
-This server is designed to be pointed at one use case — a single dataset plus
-its associated models/decisions — and become an expert on it. You do that with
-environment variables, no code changes:
+All settings are environment variables (or `.env`); the full table is in
+[`examples/configuration.md`](examples/configuration.md#environment-file-options). The ones that define
+the use case:
 
 | Variable | Purpose |
 |---|---|
 | `USE_CASE_NAME` / `USE_CASE_DESCRIPTION` | Identify the use case (returned by `get_use_case`) |
-| `ALLOWED_TABLES` | The dataset(s). The **first** entry is the *primary* table the data tools default to. Each entry: `table`, `caslib.table`, or `server.caslib.table` |
-| `ALLOWED_MODELS` | Ready model IDs or names the agent may score against |
-| `ALLOWED_DECISIONS` | Decision / MAS-module IDs or names the agent may score against |
-| `DEFAULT_CAS_SERVER` | CAS server used when a table entry omits it (default `cas-shared-default`) |
-| `DEFAULT_CASLIB` | Caslib used when a table entry omits it (default `Public`) |
-| `SCOPE_ENFORCE` | `true` (default) blocks out-of-scope access; `false` only hides it from listings |
+| `ALLOWED_TABLES` | The dataset(s). The **first** entry is the primary table the data tools default to. Each entry: `table`, `caslib.table` or `server.caslib.table` |
+| `ALLOWED_MODELS` / `ALLOWED_DECISIONS` | Published MAS module ids or names the agent may score against (both feed one allowlist) |
+| `DEFAULT_CAS_SERVER` / `DEFAULT_CASLIB` | Used when a table entry omits them (`cas-shared-default` / `Public`) |
+| `SCOPE_ENFORCE` | `true` (default) blocks out-of-scope tables and models; `false` only hides them |
 
-Entries are comma- or newline-separated and matched case-insensitively against both IDs and names. When a scope is active:
+With none of the `ALLOWED_*` variables set the server is unscoped: every tool works, tables must be
+named explicitly, and any published model can be scored.
 
-- the data tools (`get_castable_info`/`columns`/`data`, `query_table`) **default to the primary table** — the agent calls them with no table arguments;
-- `get_use_case` tells the agent its scope deterministically, including the primary table's **columns**, so it's grounded without relying on the system prompt;
-- `list_models_and_decisions` returns **only** the allowed models/decisions;
-- `score_data` **refuses** out-of-scope modules when `SCOPE_ENFORCE=true`;
-- `execute_sas_code` and `query_table` remain unrestricted (so the agent can still freely analyse its dataset).
+## How it works
 
-With none of the `ALLOWED_*` variables set, the server has full access to the environment. This makes it easy to stand up many per-use-case assistants from one image — for example, in **SAS Retrieval Agent Manager**, register the container once as a **Container MCP Server** code template, then create one tool server per use case and set these variables on its Environment Variables tab.
-
-## MCP Client Configuration
-
-Example configurations are provided in the `examples/` folder. Below are quick-start snippets for common clients.
-
-### VS Code / Cursor / Claude Code (`.vscode/mcp.json`)
-
-**HTTP mode** (requires `uv run app` running separately):
-```json
-{
-    "servers": {
-        "sas-execution-mcp": {
-            "url": "http://localhost:8134/mcp",
-            "type": "http"
-        }
-    }
-}
-```
-
-**Stdio mode** (starts the server on demand):
-```json
-{
-    "servers": {
-        "sas-execution-mcp": {
-            "command": "uv",
-            "args": ["run", "app-stdio"],
-            "cwd": "${workspaceFolder}"
-        }
-    }
-}
-```
-
-### Gemini CLI (`.gemini/settings.json`)
-
-Gemini CLI only supports stdio mode. Add to your `~/.gemini/settings.json` or project-level `.gemini/settings.json`:
-
-```json
-{
-    "mcpServers": {
-        "sas-viya-mcp": {
-            "command": "uv",
-            "args": ["run", "app-stdio"],
-            "cwd": "/path/to/sas-mcp-server",
-            "timeout": 60000
-        }
-    }
-}
-```
-
-> **Note:** The `timeout` field (in milliseconds) is important — SAS Viya API calls can take longer than the Gemini CLI default of 10 seconds. A value of `60000` (60s) is recommended. Set `cwd` to the absolute path of your `sas-mcp-server` checkout.
-
-## Example
-
-Execute SAS code through the MCP tool:
-```sas
-data work.students;
-input Name $ Age Grade $;
-datalines;
-Alice 20 A
-Bob 22 B
-;
-run;
-
-proc print data=work.students;
-run;
-```
----
-
-**For more details, configuration options, and deployment options, please refer to the **examples** folder and follow the instructions listed there.**
+- **Querying.** `query_data` screens the statement (single `SELECT`, no macro triggers, balanced quotes —
+  an unterminated literal would wedge the session), qualifies bare table names against `ALLOWED_TABLES`
+  and refuses qualified names outside it, then runs FedSQL in a **warm compute session** that is kept
+  per user and reused, so a query takes about a second instead of paying a session start each call.
+  Every request in direct-HTTP mode carries the same service-account token, so many chat users share one
+  session: a per-session lock serialises their jobs (a compute session runs one job at a time). A job that
+  overruns `JOB_POLL_TIMEOUT` is abandoned and its session discarded so nothing can block later calls.
+  Rows are read back from a format-stripped copy (numbers stay numbers, missings are `null`, dates become
+  ISO text) and capped at `limit` with a `truncated` flag.
+- **Scoring.** `score_data` resolves the module by id or display name (cached), lists its steps and
+  prefers `score` (models) over `execute` (decisions), maps the record onto the declared inputs and posts
+  to MAS. Nothing is persisted.
+- **Errors** from Viya are quoted verbatim (`HTTP 404 from GET /… — Viya reported: …`) instead of a bare
+  status code, so the agent can correct itself.
+- **Tool annotations.** Every tool advertises `readOnlyHint`; only `score_data` is not read-only.
 
 ## Testing
 
-The project includes two layers of tests: **unit tests** (fast, no credentials required) and **integration tests** (run against a real SAS Viya instance).
-
-### Running Unit Tests
-
-Unit tests verify tool schemas, request payloads, and internal logic without making any network calls:
-
 ```sh
-./run_tests.sh
+./run_tests.sh                       # unit tests (no Viya needed)
+./run_tests.sh --integration         # + end-to-end against VIYA_ENDPOINT/VIYA_USERNAME/VIYA_PASSWORD
+uv run ruff check src tests          # lint
 ```
 
-Or directly via pytest:
+The integration tests target the SAS sample table `Public.HMEQ` and skip what is not present.
 
-```sh
-uv run python -m pytest -m "not integration" -v
-```
+## Publishing
 
-### Running Integration Tests
+`.github/workflows/build-and-push.yml` builds a multi-arch image (amd64 + arm64) and pushes it to
+`ghcr.io/<owner>/sas-mcp-usecase` on every push to `main`, on every `v*` tag, and on **Run workflow**
+from the Actions tab (any branch). Each build pushes `:latest`, `:<version from pyproject.toml>` and
+`:sha-<commit>`; a `v*` tag adds the semver tags. `ci.yml` runs lint, the unit tests and a wheel build on
+every push and pull request.
 
-Integration tests call every tool against a live Viya environment. They require credentials, which can be provided via CLI arguments or `.env`:
+The Python package builds with `uv build` (`sas-mcp-usecase`, import name `sas_mcp_server`) and can be
+installed straight from git: `pip install git+https://github.com/raedaldweik/SAS_Use_Case.git`.
 
-**Using `.env`** (set `VIYA_ENDPOINT`, `VIYA_USERNAME`, `VIYA_PASSWORD`):
-```sh
-./run_tests.sh --integration
-```
+## Relationship to sassoftware/sas-mcp-server
 
-**Using CLI arguments:**
-```sh
-./run_tests.sh --integration \
-    --endpoint https://your-viya-server.com \
-    --username youruser \
-    --password yourpassword
-```
-
-**Integration tests only** (skip unit tests):
-```sh
-./run_tests.sh --integration-only
-```
-
-### Test Structure
-
-| File | Description |
-|---|---|
-| `tests/test_tool_payloads.py` | Payload assertions for the 14 tools — verifies the tool set, URL paths, JSON body structure, query params, and headers |
-| `tests/test_usecase.py` | Use-case scoping, auto-scope resolution, and guard/filter behavior |
-| `tests/test_integration.py` | End-to-end workflow tests against a real Viya instance |
-| `tests/test_tools.py` | Unit tests for HTTP helper functions (`_get_json`, `_post_json`, etc.) |
-| `tests/test_viya_utils.py` | Unit tests for Viya compute session and job utilities |
-| `tests/test_mcp_server.py` | Unit tests for MCP server and auth middleware |
-| `tests/test_prompts.py` | Unit tests for prompt template rendering |
-| `tests/test_config.py` | Unit tests for configuration loading |
-
-## Contributing
-Maintainers are accepting patches and contributions to this project. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details about submitting contributions to this project.
+This repository tracks the upstream server's internals but not its surface. Ported from upstream 1.15.0:
+the FedSQL query engine and its error mapping, the compute-session pool, `raise_for_viya_status`, the
+`SSL_VERIFY=false` patch (httpx and httpx2), MCP tool annotations and the FastMCP 4 migration. Deliberately
+not included: SAS code execution, AutoML, reports, batch jobs, decisioning authoring, the glossary, and MCP
+Apps views — a use-case agent does not need them, and a smaller tool set keeps it reliable.
 
 ## License & Attribution
 
-Except for the the contents of the /static folder, this project is licensed under the [Apache 2.0 License](LICENSE). Elements in the /static folder are owned by SAS and are not released under an open source license. SAS and all other SAS Institute Inc. product or service names are registered trademarks or trademarks of SAS Institute Inc. in the USA and other countries. ® indicates USA registration.
+Except for the contents of the /static folder, this project is licensed under the
+[Apache 2.0 License](LICENSE). Elements in the /static folder are owned by SAS and are not released under
+an open source license. SAS and all other SAS Institute Inc. product or service names are registered
+trademarks or trademarks of SAS Institute Inc. in the USA and other countries. ® indicates USA registration.
 
-Separate commercial licenses for SAS software (e.g., SAS Viya) are not included and are required to use these capabilities with SAS software.
+Separate commercial licenses for SAS software (e.g., SAS Viya) are not included and are required to use
+these capabilities with SAS software. All third-party trademarks referenced belong to their respective
+owners.
 
-All third-party trademarks referenced belong to their respective owners and are only used here for identification and reference purposes, and not to imply any affiliation or endorsement by the trademark owners.
-
-This project requires the usage of the following:
-
-- Python, see the Python license [here](https://docs.python.org/3/license.html)
-- FastMCP, under the Apache 2.0 License
-- uvicorn, under the BSD 3-Clause
-- starlette, under the BSD 3-Clause
-- httpx, under the MIT license
+This project uses Python ([license](https://docs.python.org/3/license.html)), FastMCP (Apache 2.0),
+uvicorn (BSD 3-Clause), starlette (BSD 3-Clause) and httpx (MIT).

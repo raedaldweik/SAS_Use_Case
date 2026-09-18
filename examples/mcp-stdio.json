@@ -1,6 +1,6 @@
 {
     "servers": {
-        "sas-execution-mcp": {
+        "sas-usecase": {
             "command": "uv",
             "args": ["run", "app-stdio"],
             "cwd": "${workspaceFolder}"

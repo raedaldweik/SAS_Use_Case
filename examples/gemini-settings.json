@@ -1,9 +1,9 @@
 {
     "mcpServers": {
-        "sas-viya-mcp": {
+        "sas-usecase": {
             "command": "uv",
             "args": ["run", "app-stdio"],
-            "cwd": "/path/to/sas-mcp-server",
+            "cwd": "/path/to/SAS_Use_Case",
             "timeout": 60000
         }
     }

@@ -1,446 +1,272 @@
 # Copyright © 2025, SAS Institute Inc., Cary, NC, USA.  All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Tests for viya_utils module.
-"""
-import pytest
+"""Tests for compute-session and job orchestration (viya_utils)."""
+
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
+
 import httpx
+import pytest
+
+from conftest import _make_404_response, _make_mock_response
+from sas_mcp_server import viya_utils
 from sas_mcp_server.viya_utils import (
+    _token_user_key,
+    get_cached_session,
     get_context_id,
-    create_session,
+    locked_session,
+    reset_cached_session,
+    run_job,
+    session_key,
+    shutdown_session_cache,
     submit_job,
     wait_job,
-    run_one_snippet,
-    run_query_rows,
-    fetch_session_table_rows,
-    fetch_full_job_log,
-    fetch_full_job_listing,
-    fetch_full_session_log,
-    _get_text,
-    _get_paged_lines
 )
 
 
-@pytest.mark.asyncio
-async def test_get_context_id_success(mock_httpx_client, mock_context_response, mock_env_vars):
-    """Test successful context ID retrieval."""
-    mock_response = AsyncMock()
-    mock_response.json = MagicMock(return_value=mock_context_response)
-    mock_httpx_client.get.return_value = mock_response
-    
-    context_id = await get_context_id(mock_httpx_client, "Test Context")
-    
-    assert context_id == "test-context-id"
-    mock_httpx_client.get.assert_called_once()
+def _client(get=None, post=None):
+    client = AsyncMock(spec=httpx.AsyncClient)
+    if get is not None:
+        client.get.side_effect = get
+    if post is not None:
+        client.post.return_value = post
+    client.delete.return_value = _make_mock_response(status_code=204)
+    return client
 
 
-@pytest.mark.asyncio
-async def test_get_context_id_not_found(mock_httpx_client, mock_env_vars):
-    """Test context ID retrieval when context is not found."""
-    mock_response = AsyncMock()
-    mock_response.json = MagicMock(return_value={"items": []})
-    mock_httpx_client.get.return_value = mock_response
-    
+def _compute_router(session_alive=True, extra=None):
+    """A GET router for the context lookup, session state and job endpoints."""
+    extra = extra or []
+
+    def route(url, **kwargs):
+        for needle, resp in extra:
+            if needle in url:
+                return resp
+        if url.endswith("/compute/contexts"):
+            return _make_mock_response({"items": [{"id": "ctx-1"}]})
+        if url.endswith("/state") and "/jobs/" not in url:
+            return _make_mock_response({}, status_code=200 if session_alive else 404)
+        return _make_mock_response({"items": [], "count": 0})
+
+    return route
+
+
+# --- context / session / job primitives --------------------------------------
+
+
+async def test_get_context_id_success(mock_env_vars):
+    client = _client(get=_compute_router())
+    assert await get_context_id(client, "Test Context") == "ctx-1"
+    assert client.get.call_args[1]["params"] == {"name": "Test Context"}
+
+
+async def test_get_context_id_not_found(mock_env_vars):
+    client = _client(get=lambda url, **kw: _make_mock_response({"items": []}))
     with pytest.raises(RuntimeError, match="Compute context not found"):
-        await get_context_id(mock_httpx_client, "NonExistent Context")
+        await get_context_id(client, "Missing")
 
 
-@pytest.mark.asyncio
-async def test_create_session(mock_httpx_client, mock_session_response, mock_env_vars):
-    """Test session creation."""
-    mock_response = AsyncMock()
-    mock_response.json = MagicMock(return_value=mock_session_response)
-    mock_httpx_client.post.return_value = mock_response
-    
-    session_id = await create_session(mock_httpx_client, "test-context-id", "test-session")
-    
-    assert session_id == "test-session-id"
-    mock_httpx_client.post.assert_called_once()
-    call_args = mock_httpx_client.post.call_args
-    assert call_args[1]["json"]["name"] == "test-session"
+async def test_submit_job_reports_viya_error_instead_of_bare_id(mock_env_vars):
+    request = httpx.Request("POST", "https://test.viya.com/compute/sessions/s/jobs")
+    response = httpx.Response(403, request=request)
+    resp = _make_mock_response({}, status_code=403, text='{"message": "The session is not available."}')
+    resp.raise_for_status = MagicMock(side_effect=httpx.HTTPStatusError("403", request=request, response=response))
+    client = _client(post=resp)
+    with pytest.raises(httpx.HTTPStatusError, match="The session is not available"):
+        await submit_job(client, "s", "data x; run;")
 
 
-@pytest.mark.asyncio
-async def test_submit_job(mock_httpx_client, mock_job_response, sample_sas_code, mock_env_vars):
-    """Test job submission."""
-    mock_response = AsyncMock()
-    mock_response.json = MagicMock(return_value=mock_job_response)
-    mock_httpx_client.post.return_value = mock_response
-    
-    job_id = await submit_job(mock_httpx_client, "test-session-id", sample_sas_code)
-    
-    assert job_id == "test-job-id"
-    mock_httpx_client.post.assert_called_once()
-    call_args = mock_httpx_client.post.call_args
-    assert "code" in call_args[1]["json"]
-    assert isinstance(call_args[1]["json"]["code"], list)
+async def test_wait_job_completed_reads_all_pages(mock_env_vars):
+    def route(url, **kwargs):
+        if url.endswith("/state"):
+            return _make_mock_response({}, text="completed")
+        if url.endswith("/log"):
+            start = kwargs["params"]["start"]
+            if start == 0:
+                return _make_mock_response({"items": [{"line": f"L{i}"} for i in range(1000)]})
+            return _make_mock_response({"items": [{"line": "LAST"}]})
+        if url.endswith("/listing"):
+            return _make_mock_response({"items": [{"line": "Obs x"}]})
+        raise AssertionError(url)
 
-
-@pytest.mark.asyncio
-async def test_wait_job_completed(mock_httpx_client, mock_job_log, mock_job_listing, mock_env_vars):
-    """Test waiting for job completion."""
-    # Mock state response
-    mock_state_response = AsyncMock()
-    mock_state_response.text = "completed"
-    
-    # Mock log response
-    mock_log_response = AsyncMock()
-    mock_log_response.json = MagicMock(return_value=mock_job_log)
-    
-    # Mock listing response
-    mock_listing_response = AsyncMock()
-    mock_listing_response.json = MagicMock(return_value=mock_job_listing)
-    
-    # Set up the client to return different responses
-    mock_httpx_client.get.side_effect = [
-        mock_state_response,
-        mock_log_response,
-        mock_listing_response
-    ]
-    
-    state, log, listing = await wait_job(mock_httpx_client, "test-session-id", "test-job-id", poll=0.01)
-    
+    client = _client(get=route)
+    state, log, listing = await wait_job(client, "s", "j", poll=0)
     assert state == "completed"
-    assert "NOTE: DATA statement used" in log
-    assert "Obs    x    y" in listing
+    assert log.startswith("L0\n") and log.endswith("\nLAST")
+    assert listing == "Obs x"
 
 
-@pytest.mark.asyncio
-async def test_wait_job_error_state(mock_httpx_client, mock_job_log, mock_job_listing, mock_env_vars):
-    """Test waiting for job that ends in error state."""
-    mock_state_response = AsyncMock()
-    mock_state_response.text = "error"
-    
-    mock_log_response = AsyncMock()
-    mock_log_response.json = MagicMock(return_value={
-        "items": [{"line": "ERROR: Something went wrong"}]
-    })
-    
-    mock_listing_response = AsyncMock()
-    mock_listing_response.json = MagicMock(return_value={"items": []})
-    
-    mock_httpx_client.get.side_effect = [
-        mock_state_response,
-        mock_log_response,
-        mock_listing_response
-    ]
-    
-    state, log, listing = await wait_job(mock_httpx_client, "test-session-id", "test-job-id", poll=0.01)
+async def test_wait_job_error_state(mock_env_vars):
+    def route(url, **kwargs):
+        if url.endswith("/state"):
+            return _make_mock_response({}, text="error")
+        return _make_mock_response({"items": [{"line": "ERROR: boom"}]})
 
+    state, log, _ = await wait_job(_client(get=route), "s", "j", poll=0)
     assert state == "error"
-    assert "ERROR: Something went wrong" in log
+    assert "ERROR: boom" in log
 
 
-@pytest.mark.asyncio
-async def test_wait_job_times_out(mock_httpx_client, mock_env_vars):
-    """A job that never reaches a terminal state raises TimeoutError once the
-    poll deadline is exceeded (safety net against a stuck compute job)."""
-    running = AsyncMock()
-    running.text = "running"
-    mock_httpx_client.get.return_value = running  # never terminal
+async def test_wait_job_polls_until_terminal(mock_env_vars):
+    states = iter(["running", "running", "completed"])
 
+    def route(url, **kwargs):
+        if url.endswith("/state"):
+            return _make_mock_response({}, text=next(states))
+        return _make_mock_response({"items": []})
+
+    with patch("sas_mcp_server.viya_utils.asyncio.sleep", new=AsyncMock()) as sleep:
+        state, _, listing = await wait_job(_client(get=route), "s", "j", poll=1)
+    assert state == "completed"
+    assert listing == "(no listing output)"
+    assert sleep.await_count == 2
+
+
+async def test_wait_job_times_out(mock_env_vars):
+    client = _client(get=lambda url, **kw: _make_mock_response({}, text="running"))
+    with pytest.raises(TimeoutError, match="did not finish"):
+        await wait_job(client, "s", "j", poll=0, timeout=-1)
+
+
+async def test_wait_job_stops_when_the_session_dies(mock_env_vars):
+    client = _client(get=lambda url, **kw: _make_404_response(url))
+    with pytest.raises(httpx.HTTPStatusError):
+        await wait_job(client, "s", "j", poll=0)
+
+
+async def test_run_job_submits_and_waits(mock_env_vars):
+    def route(url, **kwargs):
+        if url.endswith("/state"):
+            return _make_mock_response({}, text="completed")
+        return _make_mock_response({"items": [{"line": "ok"}]})
+
+    client = _client(get=route, post=_make_mock_response({"id": "J1"}, status_code=201))
+    state, log, listing = await run_job(client, "sess", "proc sql; quit;", poll=0)
+    assert state == "completed"
+    assert client.post.call_args[0][0].endswith("/compute/sessions/sess/jobs")
+    assert client.post.call_args[1]["json"] == {"code": ["proc sql; quit;"]}
+
+
+# --- per-user keys -----------------------------------------------------------
+
+
+def _jwt(sub):
+    import base64
+    import json
+
+    payload = base64.urlsafe_b64encode(json.dumps({"sub": sub}).encode()).decode().rstrip("=")
+    return f"hdr.{payload}.sig"
+
+
+def test_token_user_key_uses_jwt_sub():
+    assert _token_user_key(_jwt("alice")) == "sub:alice"
+    assert _token_user_key("Bearer " + _jwt("alice")) == "sub:alice"
+
+
+def test_token_user_key_falls_back_on_undecodable_token():
+    assert _token_user_key("opaque").startswith("token:")
+    assert _token_user_key("opaque") == _token_user_key("opaque")
+    assert _token_user_key("opaque") != _token_user_key("other")
+
+
+def test_session_key_is_constant_in_fixed_session_mode():
+    with patch.object(viya_utils, "COMPUTE_SESSION_ID", "0001"):
+        assert session_key(_jwt("a"), "c") == session_key(_jwt("b"), "d") == ("fixed", "0001")
+
+
+# --- the session pool --------------------------------------------------------
+
+
+async def test_get_cached_session_creates_then_reuses(mock_env_vars):
+    client = _client(get=_compute_router(), post=_make_mock_response({"id": "sess-1"}, status_code=201))
+    first = await get_cached_session(client, "ctx", _jwt("alice"))
+    second = await get_cached_session(client, "ctx", _jwt("alice"))
+    assert first == second == "sess-1"
+    assert client.post.call_count == 1
+
+
+async def test_get_cached_session_recreates_when_reaped(mock_env_vars):
+    alive = {"value": True}
+
+    def route(url, **kwargs):
+        if url.endswith("/state") and "/jobs/" not in url:
+            return _make_mock_response({}, status_code=200 if alive["value"] else 404)
+        return _compute_router()(url, **kwargs)
+
+    posts = iter([_make_mock_response({"id": "sess-1"}, 201), _make_mock_response({"id": "sess-2"}, 201)])
+    client = _client(get=route)
+    client.post.side_effect = lambda *a, **k: next(posts)
+    assert await get_cached_session(client, "ctx", _jwt("a")) == "sess-1"
+    alive["value"] = False
+    assert await get_cached_session(client, "ctx", _jwt("a")) == "sess-2"
+
+
+async def test_get_cached_session_is_per_user(mock_env_vars):
+    posts = iter([_make_mock_response({"id": "sess-a"}, 201), _make_mock_response({"id": "sess-b"}, 201)])
+    client = _client(get=_compute_router())
+    client.post.side_effect = lambda *a, **k: next(posts)
+    assert await get_cached_session(client, "ctx", _jwt("alice")) == "sess-a"
+    assert await get_cached_session(client, "ctx", _jwt("bob")) == "sess-b"
+
+
+async def test_reset_cached_session_deletes_and_forgets(mock_env_vars):
+    client = _client(get=_compute_router(), post=_make_mock_response({"id": "sess-1"}, 201))
+    await get_cached_session(client, "ctx", _jwt("a"))
+    assert await reset_cached_session(client, "ctx", _jwt("a")) == "sess-1"
+    assert client.delete.call_args[0][0].endswith("/compute/sessions/sess-1")
+    assert await reset_cached_session(client, "ctx", _jwt("a")) is None
+
+
+async def test_shutdown_deletes_every_cached_session(mock_env_vars):
+    client = _client(get=_compute_router(), post=_make_mock_response({"id": "sess-1"}, 201))
+    await get_cached_session(client, "ctx", _jwt("a"))
+    deleter = AsyncMock(spec=httpx.AsyncClient)
+    deleter.__aenter__ = AsyncMock(return_value=deleter)
+    deleter.__aexit__ = AsyncMock(return_value=False)
+    with patch("sas_mcp_server.viya_utils.make_client", return_value=deleter):
+        await shutdown_session_cache()
+    deleter.delete.assert_awaited_once()
+    assert deleter.delete.call_args[0][0].endswith("/compute/sessions/sess-1")
+
+
+# --- locked_session ------------------------------------------------------------
+
+
+async def test_locked_session_serialises_jobs_in_one_session(mock_env_vars):
+    """Two concurrent callers sharing a token must not interleave inside the session."""
+    client = _client(get=_compute_router(), post=_make_mock_response({"id": "sess-1"}, 201))
+    token = _jwt("service-account")
+    events = []
+
+    async def worker(name):
+        async with locked_session(client, token) as sid:
+            events.append(f"{name}-in:{sid}")
+            await asyncio.sleep(0.01)
+            events.append(f"{name}-out")
+
+    await asyncio.gather(worker("a"), worker("b"))
+    assert events == ["a-in:sess-1", "a-out", "b-in:sess-1", "b-out"]
+
+
+async def test_locked_session_abandons_the_session_on_timeout(mock_env_vars):
+    client = _client(get=_compute_router(), post=_make_mock_response({"id": "sess-1"}, 201))
+    token = _jwt("a")
     with pytest.raises(TimeoutError):
-        await wait_job(mock_httpx_client, "test-session-id", "test-job-id",
-                       poll=0.01, timeout=0.05)
+        async with locked_session(client, token):
+            raise TimeoutError("job overran")
+    client.delete.assert_awaited_once()
+    assert client.delete.call_args[0][0].endswith("/compute/sessions/sess-1")
+    # The next caller gets a fresh session rather than queueing behind the wedged one.
+    client.post.return_value = _make_mock_response({"id": "sess-2"}, 201)
+    async with locked_session(client, token) as sid:
+        assert sid == "sess-2"
 
 
-@pytest.mark.asyncio
-async def test_get_text_success(mock_httpx_client):
-    """Test _get_text when text/plain is returned."""
-    mock_response = AsyncMock()
-    mock_response.status_code = 200
-    mock_response.headers = {"Content-Type": "text/plain"}
-    mock_response.text = "Sample text output"
-    mock_httpx_client.get.return_value = mock_response
-    
-    result = await _get_text("/test/endpoint", mock_httpx_client)
-    
-    assert result == "Sample text output"
-
-
-@pytest.mark.asyncio
-async def test_get_text_fallback(mock_httpx_client):
-    """Test _get_text fallback when first attempt fails."""
-    mock_response_1 = AsyncMock()
-    mock_response_1.status_code = 404
-    mock_response_1.headers = {}
-    
-    mock_response_2 = AsyncMock()
-    mock_response_2.status_code = 200
-    mock_response_2.headers = {"Content-Type": "text/plain"}
-    mock_response_2.text = "Sample text output"
-    
-    mock_httpx_client.get.side_effect = [mock_response_1, mock_response_2]
-    
-    result = await _get_text("/test/endpoint", mock_httpx_client)
-    
-    assert result == "Sample text output"
-    assert mock_httpx_client.get.call_count == 2
-
-
-@pytest.mark.asyncio
-async def test_get_text_failure(mock_httpx_client):
-    """Test _get_text when both attempts fail."""
-    mock_response = AsyncMock()
-    mock_response.status_code = 404
-    mock_response.headers = {}
-    
-    mock_httpx_client.get.return_value = mock_response
-    
-    result = await _get_text("/test/endpoint", mock_httpx_client)
-    
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_get_paged_lines(mock_httpx_client):
-    """Test _get_paged_lines pagination."""
-    # First page
-    mock_response_1 = AsyncMock()
-    mock_response_1.raise_for_status = MagicMock()
-    mock_response_1.json = MagicMock(return_value={
-        "items": [
-            {"line": "Line 1"},
-            {"line": "Line 2"}
-        ]
-    })
-    
-    # Second page (empty, ends pagination)
-    mock_response_2 = AsyncMock()
-    mock_response_2.raise_for_status = MagicMock()
-    mock_response_2.json = MagicMock(return_value={"items": []})
-    
-    mock_httpx_client.get.side_effect = [mock_response_1, mock_response_2]
-    
-    result = await _get_paged_lines("/test/endpoint", mock_httpx_client, page_limit=2)
-    
-    assert result == "Line 1\nLine 2"
-    assert mock_httpx_client.get.call_count == 2
-
-
-@pytest.mark.asyncio
-async def test_fetch_full_job_log(mock_httpx_client):
-    """Test fetching full job log."""
-    mock_response = AsyncMock()
-    mock_response.status_code = 200
-    mock_response.headers = {"Content-Type": "text/plain"}
-    mock_response.text = "Job log output"
-    mock_httpx_client.get.return_value = mock_response
-    
-    result = await fetch_full_job_log(mock_httpx_client, "session-id", "job-id")
-    
-    assert result == "Job log output"
-
-
-@pytest.mark.asyncio
-async def test_fetch_full_job_listing(mock_httpx_client):
-    """Test fetching full job listing."""
-    mock_response = AsyncMock()
-    mock_response.status_code = 200
-    mock_response.headers = {"Content-Type": "text/plain"}
-    mock_response.text = "Job listing output"
-    mock_httpx_client.get.return_value = mock_response
-    
-    result = await fetch_full_job_listing(mock_httpx_client, "session-id", "job-id")
-    
-    assert result == "Job listing output"
-
-
-@pytest.mark.asyncio
-async def test_run_one_snippet_success(sample_sas_code, mock_access_token, mock_env_vars):
-    """Test successful execution of a SAS code snippet."""
-    with patch('sas_mcp_server.viya_utils.httpx.AsyncClient') as mock_client_class:
-        mock_client = AsyncMock()
-        mock_client_class.return_value.__aenter__.return_value = mock_client
-        
-        # Mock all the API calls
-        mock_context_response = AsyncMock()
-        mock_context_response.json = MagicMock(return_value={"items": [{"id": "ctx-id"}]})
-        
-        mock_session_response = AsyncMock()
-        mock_session_response.json = MagicMock(return_value={"id": "sess-id"})
-        
-        mock_job_response = AsyncMock()
-        mock_job_response.json = MagicMock(return_value={"id": "job-id"})
-        
-        mock_state_response = AsyncMock()
-        mock_state_response.text = "completed"
-        
-        mock_log_response = AsyncMock()
-        mock_log_response.json = MagicMock(return_value={"items": [{"line": "Log output"}]})
-        
-        mock_listing_response = AsyncMock()
-        mock_listing_response.json = MagicMock(return_value={"items": [{"line": "Listing output"}]})
-        
-        mock_delete_response = AsyncMock()
-        
-        mock_client.get.side_effect = [
-            mock_context_response,
-            mock_state_response,
-            mock_log_response,
-            mock_listing_response
-        ]
-        mock_client.post.side_effect = [mock_session_response, mock_job_response]
-        mock_client.delete.return_value = mock_delete_response
-        
-        result = await run_one_snippet(sample_sas_code, "1", mock_access_token)
-        
-        assert result[0] == "1"  # snippet_id
-        assert result[1] == "completed"  # state
-        assert "Log output" in result[2]  # log
-        assert "Listing output" in result[3]  # listing
-
-
-@pytest.mark.asyncio
-async def test_run_one_snippet_with_bearer_prefix(sample_sas_code, mock_env_vars):
-    """Test that Bearer prefix is handled correctly."""
-    token_with_bearer = "Bearer test-token"
-    
-    with patch('sas_mcp_server.viya_utils.httpx.AsyncClient') as mock_client_class:
-        mock_client = AsyncMock()
-        mock_client_class.return_value.__aenter__.return_value = mock_client
-        
-        # Mock minimal responses for the test
-        mock_context_response = AsyncMock()
-        mock_context_response.json = MagicMock(return_value={"items": [{"id": "ctx-id"}]})
-        
-        mock_session_response = AsyncMock()
-        mock_session_response.json = MagicMock(return_value={"id": "sess-id"})
-        
-        mock_job_response = AsyncMock()
-        mock_job_response.json = MagicMock(return_value={"id": "job-id"})
-        
-        mock_state_response = AsyncMock()
-        mock_state_response.text = "completed"
-        
-        mock_log_response = AsyncMock()
-        mock_log_response.json = MagicMock(return_value={"items": []})
-        
-        mock_listing_response = AsyncMock()
-        mock_listing_response.json = MagicMock(return_value={"items": []})
-        
-        mock_delete_response = AsyncMock()
-        
-        mock_client.get.side_effect = [
-            mock_context_response,
-            mock_state_response,
-            mock_log_response,
-            mock_listing_response
-        ]
-        mock_client.post.side_effect = [mock_session_response, mock_job_response]
-        mock_client.delete.return_value = mock_delete_response
-        
-        result = await run_one_snippet(sample_sas_code, "1", token_with_bearer)
-
-        # Verify the client was created with Bearer token
-        call_kwargs = mock_client_class.call_args[1]
-        assert "Authorization" in call_kwargs["headers"]
-        assert call_kwargs["headers"]["Authorization"] == token_with_bearer
-
-
-@pytest.mark.asyncio
-async def test_fetch_session_table_rows(mock_httpx_client):
-    """Columns + rows are zipped into row dicts via the Compute data API."""
-    col_resp = AsyncMock()
-    col_resp.raise_for_status = MagicMock()
-    col_resp.json = MagicMock(return_value={
-        "items": [{"name": "nationality"}, {"name": "n"}]})
-    row_resp = AsyncMock()
-    row_resp.raise_for_status = MagicMock()
-    row_resp.json = MagicMock(return_value={
-        "items": [{"cells": ["KW", 10]}, {"cells": ["AE", 7]}]})
-    mock_httpx_client.get.side_effect = [col_resp, row_resp]
-
-    cols, rows = await fetch_session_table_rows(
-        mock_httpx_client, "sess-1", "WORK", "_MCPQ", limit=50)
-
-    assert cols == ["nationality", "n"]
-    assert rows == [{"nationality": "KW", "n": 10}, {"nationality": "AE", "n": 7}]
-    # The two calls hit the columns and rows sub-resources of the session table.
-    col_url = mock_httpx_client.get.call_args_list[0][0][0]
-    row_url = mock_httpx_client.get.call_args_list[1][0][0]
-    assert "/compute/sessions/sess-1/data/WORK/_MCPQ/columns" in col_url
-    assert "/compute/sessions/sess-1/data/WORK/_MCPQ/rows" in row_url
-
-
-@pytest.mark.asyncio
-async def test_run_query_rows_success(mock_access_token, mock_env_vars):
-    """run_query_rows wraps the SELECT, runs it, and returns structured rows."""
-    with patch('sas_mcp_server.viya_utils.httpx.AsyncClient') as mock_client_class:
-        mock_client = AsyncMock()
-        mock_client_class.return_value.__aenter__.return_value = mock_client
-
-        def _resp(json_data=None, text=None):
-            r = AsyncMock()
-            r.raise_for_status = MagicMock()
-            r.json = MagicMock(return_value=json_data or {})
-            if text is not None:
-                r.text = text
-            return r
-
-        # GET order: context, job-state, log, listing, columns, rows
-        mock_client.get.side_effect = [
-            _resp({"items": [{"id": "ctx-id"}]}),
-            _resp(text="completed"),
-            _resp({"items": [{"line": "NOTE: ok"}]}),
-            _resp({"items": [{"line": "out"}]}),
-            _resp({"items": [{"name": "bad"}, {"name": "n"}]}),
-            _resp({"items": [{"cells": [0, 4771]}, {"cells": [1, 1189]}]}),
-        ]
-        mock_client.post.side_effect = [
-            _resp({"id": "sess-id"}),   # create_session
-            _resp({"id": "job-id"}),    # submit_job
-        ]
-        mock_client.delete.return_value = _resp()
-
-        result = await run_query_rows(
-            "select bad, count(*) as n from Public.HMEQ group by bad",
-            mock_access_token, limit=10)
-
-        assert result["error"] is False
-        assert result["state"] == "completed"
-        assert result["columns"] == ["bad", "n"]
-        assert result["rows"] == [{"bad": 0, "n": 4771}, {"bad": 1, "n": 1189}]
-        assert result["rowCount"] == 2
-
-        # The SELECT is wrapped in proc sql writing to WORK._MCPQ.
-        submitted_code = "\n".join(mock_client.post.call_args_list[1][1]["json"]["code"])
-        assert "create table work._mcpq as" in submitted_code
-        assert "group by bad" in submitted_code
-
-
-@pytest.mark.asyncio
-async def test_run_query_rows_error_returns_log(mock_access_token, mock_env_vars):
-    """A SAS error returns the log instead of rows so the caller can correct it."""
-    with patch('sas_mcp_server.viya_utils.httpx.AsyncClient') as mock_client_class:
-        mock_client = AsyncMock()
-        mock_client_class.return_value.__aenter__.return_value = mock_client
-
-        def _resp(json_data=None, text=None):
-            r = AsyncMock()
-            r.raise_for_status = MagicMock()
-            r.json = MagicMock(return_value=json_data or {})
-            if text is not None:
-                r.text = text
-            return r
-
-        mock_client.get.side_effect = [
-            _resp({"items": [{"id": "ctx-id"}]}),
-            _resp(text="error"),
-            _resp({"items": [{"line": "ERROR: Syntax error"}]}),
-            _resp({"items": []}),
-        ]
-        mock_client.post.side_effect = [
-            _resp({"id": "sess-id"}),
-            _resp({"id": "job-id"}),
-        ]
-        mock_client.delete.return_value = _resp()
-
-        result = await run_query_rows("select oops", mock_access_token)
-
-        assert result["error"] is True
-        assert result["state"] == "error"
-        assert "ERROR: Syntax error" in result["log"]
-        assert result["rows"] == []
+async def test_locked_session_fixed_mode_skips_lookup(mock_env_vars):
+    client = _client(get=_compute_router())
+    with patch.object(viya_utils, "COMPUTE_SESSION_ID", "0001"):
+        async with locked_session(client, "tok") as sid:
+            assert sid == "0001"
+    client.get.assert_not_called()
+    client.post.assert_not_called()

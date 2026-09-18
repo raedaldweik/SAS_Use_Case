@@ -1,189 +1,92 @@
 # Copyright © 2025, SAS Institute Inc., Cary, NC, USA.  All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Integration tests that call the use-case MCP tools against a real SAS Viya
-instance.
+"""Integration tests that call the use-case tools against a real SAS Viya instance.
 
-Requires VIYA_ENDPOINT, VIYA_USERNAME, and VIYA_PASSWORD environment variables.
-Run with:  uv run python -m pytest -m integration
+Requires VIYA_ENDPOINT, VIYA_USERNAME, and VIYA_PASSWORD. Run with:
+    uv run python -m pytest -m integration
 
-These exercise only the lean, use-case-scoped tool set. They target a known
-sample table — ``HMEQ`` in caslib ``Public`` on ``cas-shared-default`` — and
-skip gracefully when it (or a required service) isn't present.
+They target the SAS sample table ``Public.HMEQ`` and skip gracefully when it
+(or a required service) is not present. Set ALLOWED_TABLES / ALLOWED_MODELS in
+the environment to exercise a scoped configuration instead.
 """
-import json
-import time
+
 import pytest
 from fastmcp import Client
 
-# Pin all integration tests to a single session-scoped event loop. The
-# session-scoped fixtures (viya_token, integration_mcp_server) and the
-# in-memory fastmcp transport must share the same loop they were created in;
-# otherwise the second test's tool call fails with ConnectError when it
-# touches httpx state bound to the prior, now-closed loop.
+# All integration tests share one session-scoped event loop with the
+# session-scoped fixtures (viya_token, integration_mcp_server).
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="session")]
 
-_SUFFIX = str(int(time.time()))[-6:]
-_SERVER = "cas-shared-default"
-_CASLIB = "Public"
-_TABLE = "HMEQ"
-
-
-# -----------------------------------------------------------------------
-# Use case & data inspection
-# -----------------------------------------------------------------------
+_TABLE = "Public.HMEQ"
 
 
 async def test_get_use_case(integration_mcp_server):
-    """get_use_case returns a manifest (scoped or not)."""
     async with Client(integration_mcp_server) as client:
         manifest = (await client.call_tool("get_use_case", {})).data
-        assert isinstance(manifest, dict)
-        assert "scoped" in manifest
+    assert isinstance(manifest, dict)
+    assert "scoped" in manifest
+    assert manifest["guidance"]
 
 
-async def test_data_inspection_workflow(integration_mcp_server):
-    """get_castable_info → get_castable_columns → get_castable_data on HMEQ."""
+async def test_describe_and_preview_table(integration_mcp_server):
     async with Client(integration_mcp_server) as client:
-        try:
-            info = (await client.call_tool("get_castable_info", {
-                "server_id": _SERVER, "caslib_name": _CASLIB, "table_name": _TABLE,
-            })).data
-        except Exception as e:
-            if "404" in str(e):
-                pytest.skip("HMEQ not loaded in Public caslib on this Viya")
-            raise
-        assert isinstance(info, dict)
-
-        columns = (await client.call_tool("get_castable_columns", {
-            "server_id": _SERVER, "caslib_name": _CASLIB, "table_name": _TABLE,
-            "limit": 10,
-        })).data
-        assert isinstance(columns, list)
-        assert len(columns) > 0
-
-        try:
-            rows = (await client.call_tool("get_castable_data", {
-                "server_id": _SERVER, "caslib_name": _CASLIB, "table_name": _TABLE,
-                "limit": 3,
-            })).data
-            assert isinstance(rows, dict)
-            assert "columns" in rows and "rows" in rows
-        except Exception:
-            pass
+        info = (await client.call_tool("describe_table", {"table": _TABLE})).data
+        if info.get("status") == "not_found":
+            pytest.skip("HMEQ not loaded in Public caslib on this Viya")
+        assert info["table"] == _TABLE
+        assert info["columns"]
+        rows = (await client.call_tool("preview_table", {"table": _TABLE, "limit": 3})).data
+        assert rows["columns"] and len(rows["rows"]) <= 3
 
 
-# -----------------------------------------------------------------------
-# Structured query (the query → chart path)
-# -----------------------------------------------------------------------
-
-
-async def test_query_table_returns_rows(integration_mcp_server):
-    """query_table runs SQL and returns structured columns + rows."""
+async def test_query_data_returns_rows(integration_mcp_server):
     async with Client(integration_mcp_server) as client:
-        result = (await client.call_tool("query_table", {
-            "sql": f"select BAD, count(*) as n from {_CASLIB}.{_TABLE} group by BAD",
-            "limit": 10,
-        })).data
-        assert isinstance(result, dict)
-        if result.get("error"):
-            pytest.skip(f"query_table could not run (likely HMEQ absent): "
-                        f"{result.get('state')}")
-        assert "columns" in result
-        assert "rows" in result
-        assert isinstance(result["rows"], list)
+        result = (
+            await client.call_tool(
+                "query_data", {"query": f"select BAD, count(*) as n from {_TABLE} group by BAD", "limit": 10}
+            )
+        ).data
+        if result.get("status") == "table_not_found":
+            pytest.skip("HMEQ not loaded in Public caslib on this Viya")
+        assert result["columns"] == ["BAD", "n"]
+        assert result["rows"]
+        # A second query reuses the warm session and still answers.
+        again = (await client.call_tool("query_data", {"query": f"select count(*) as n from {_TABLE}"})).data
+        assert again["rows"][0]["n"] > 0
 
 
-# -----------------------------------------------------------------------
-# SAS Code Execution
-# -----------------------------------------------------------------------
-
-
-async def test_sas_code_execution(integration_mcp_server):
-    """execute_sas_code with a simple DATA step + PROC PRINT."""
+async def test_query_data_reports_bad_sql_structurally(integration_mcp_server):
     async with Client(integration_mcp_server) as client:
-        code = """
-data work.mcp_test;
-    x = 42;
-    y = "hello";
-    output;
-run;
-
-proc print data=work.mcp_test;
-run;
-"""
-        result = await client.call_tool("execute_sas_code", {"sas_code": code})
-        parsed = json.loads(result.content[0].text)
-        assert isinstance(parsed, list)
-        assert len(parsed) == 4
-        snippet_id, state, log, listing = parsed
-        assert state in ("completed", "warning")
-        assert "mcp_test" in log.lower() or "NOTE" in log
+        result = (await client.call_tool("query_data", {"query": "select nope from Public.DOES_NOT_EXIST"})).data
+    assert result["status"] in ("table_not_found", "column_not_found", "query_failed", "schema_not_found")
 
 
-# -----------------------------------------------------------------------
-# Model building (AutoML)
-# -----------------------------------------------------------------------
-
-
-async def test_ml_project_workflow(integration_mcp_server):
-    """create_ml_project → list_ml_projects → get_ml_project_results → delete_ml_project."""
+async def test_render_chart_from_query(integration_mcp_server):
     async with Client(integration_mcp_server) as client:
-        try:
-            project = (await client.call_tool("create_ml_project", {
-                "project_name": f"MCP Integration Test {_SUFFIX}",
-                "data_table_uri": (f"/dataTables/dataSources/"
-                                   f"cas~fs~{_SERVER}~fs~{_CASLIB}/tables/{_TABLE}"),
-                "target_variable": "BAD",
-                "prediction_type": "binary",
-                "target_event_level": "1",
-                "auto_run": False,
-            })).data
-        except Exception as e:
-            if "404" in str(e):
-                pytest.skip("HMEQ not available to train against on this Viya")
-            raise
-        assert isinstance(project, dict)
-        assert "id" in project
-        project_id = project["id"]
-
-        try:
-            projects = (await client.call_tool("list_ml_projects", {"limit": 100})).data
-            assert any(p["id"] == project_id for p in projects)
-
-            results = (await client.call_tool("get_ml_project_results", {
-                "project_id": project_id,
-            })).data
-            assert isinstance(results, dict)
-            assert results["projectId"] == project_id
-            assert "state" in results
-        finally:
-            # Clean up the project we created.
-            await client.call_tool("delete_ml_project", {"project_id": project_id})
-
-
-# -----------------------------------------------------------------------
-# Ready models & decisions — listing and scoring
-# -----------------------------------------------------------------------
+        result = (
+            await client.call_tool("query_data", {"query": f"select JOB, count(*) as n from {_TABLE} group by JOB"})
+        ).data
+        if result.get("status"):
+            pytest.skip("HMEQ not available")
+        chart = (
+            await client.call_tool(
+                "render_chart",
+                {"chart_type": "bar", "title": "Loans by job", "data": result["rows"], "x_key": "JOB", "y_keys": ["n"]},
+            )
+        ).data
+    assert chart["kind"] == "chart"
 
 
 async def test_scoring_workflow(integration_mcp_server):
-    """list_models_and_decisions → score_data (best-effort)."""
     async with Client(integration_mcp_server) as client:
-        modules = (await client.call_tool("list_models_and_decisions", {"limit": 5})).data
-        assert isinstance(modules, list)
-
-        if not modules:
-            pytest.skip("No MAS modules found — cannot test score_data")
-
-        module_id = modules[0]["id"]
-        try:
-            result = (await client.call_tool("score_data", {
-                "module_id": module_id,
-                "input_data": {"x": 1},
-            })).data
-            assert isinstance(result, dict)
-        except Exception:
-            pytest.skip(f"Module {module_id} does not have a 'score' step "
-                        f"or expects different inputs")
+        listing = (await client.call_tool("list_models", {})).data
+        if not listing["models"]:
+            pytest.skip("No MAS modules published — cannot test scoring")
+        model = listing["models"][0]["id"]
+        sig = (await client.call_tool("describe_model", {"model": model})).data
+        assert sig.get("stepId")
+        record = {i["name"]: (1 if i["type"] != "string" else "x") for i in sig["inputs"]}
+        result = (await client.call_tool("score_data", {"model": model, "input_data": record})).data
+        assert result.get("model") == model
+        assert "outputs" in result

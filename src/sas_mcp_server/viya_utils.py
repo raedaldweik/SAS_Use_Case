@@ -1,165 +1,42 @@
 # Copyright © 2025, SAS Institute Inc., Cary, NC, USA.  All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""SAS Viya compute session and job orchestration.
+
+These helpers drive the Compute service end to end: resolve a compute context,
+open a session, submit code, and poll for completion.
+
+To avoid paying the (slow) session spin-up cost on every query, compute
+sessions are pooled by :class:`_ComputeSessionCache`: one reusable session per
+authenticated user and compute context. In the headless modes every request
+carries the same service-account token, so many chat users share one warm
+session; a per-session **job lock** serialises their jobs, because a compute
+session runs one job at a time. Queries here take about a second, so waiting
+on the lock is cheaper than spinning up a session per call.
+
+A job that overruns ``JOB_POLL_TIMEOUT`` is abandoned and its session
+discarded, so a wedged query can never block every later call.
+"""
+
 import asyncio
-import os
+import base64
+import binascii
+import hashlib
+import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 import httpx
-from fastmcp.utilities.logging import get_logger
-from .config import VIYA_ENDPOINT, CONTEXT_NAME, SSL_VERIFY
 
-logger = get_logger(__name__)
-
-# Safety net: the longest we will poll a single compute job before giving up,
-# so a stuck job can never hang the agent indefinitely. Generous by default
-# (1 hour) so legitimate long-running SAS code (heavy PROCs, large-data steps)
-# is unaffected; override with the JOB_POLL_TIMEOUT environment variable
-# (seconds) — raise it for very long workloads, lower it for snappier failure.
-JOB_POLL_TIMEOUT = float(os.getenv("JOB_POLL_TIMEOUT", "3600"))
+from .config import COMPUTE_SESSION_ID, CONTEXT_NAME, JOB_POLL_TIMEOUT, VIYA_ENDPOINT
+from .viya_client import logger, make_client, raise_for_viya_status
 
 
-# ---------------------------------------------------------------------------
-# Generic API helpers (used by new tools)
-# ---------------------------------------------------------------------------
-
-async def _get_json(url, client, params=None, accept="application/json"):
-    """GET a JSON response from a Viya REST endpoint."""
-    full_url = f"{VIYA_ENDPOINT}{url}"
-    resp = await client.get(full_url, headers={"Accept": accept}, params=params or {})
-    resp.raise_for_status()
-    return resp.json()
-
-
-async def _get_paged_items(url, client, limit=20, start=0, filters=None, extra_params=None):
-    """GET a paginated collection and return the items list plus total count."""
-    params = {"start": start, "limit": limit}
-    if filters:
-        params["filter"] = filters
-    if extra_params:
-        params.update(extra_params)
-    data = await _get_json(url, client, params=params,
-                           accept="application/vnd.sas.collection+json")
-    return data.get("items", []), data.get("count", 0)
-
-
-async def _post_json(url, client, body=None, params=None, accept="application/json"):
-    """POST JSON to a Viya REST endpoint and return the response JSON."""
-    full_url = f"{VIYA_ENDPOINT}{url}"
-    resp = await client.post(full_url, json=body,
-                             headers={"Content-Type": "application/json",
-                                      "Accept": accept},
-                             params=params or {})
-    resp.raise_for_status()
-    if resp.status_code == 204 or not resp.content:
-        return {}
-    return resp.json()
-
-
-async def _put_data(url, client, data, content_type="text/csv", params=None):
-    """PUT raw data (e.g. CSV upload) to a Viya REST endpoint."""
-    full_url = f"{VIYA_ENDPOINT}{url}"
-    resp = await client.put(full_url, content=data,
-                            headers={"Content-Type": content_type},
-                            params=params or {})
-    resp.raise_for_status()
-    if resp.status_code == 204 or not resp.content:
-        return {}
-    return resp.json()
-
-
-async def _delete_resource(url, client):
-    """DELETE a Viya REST resource."""
-    full_url = f"{VIYA_ENDPOINT}{url}"
-    resp = await client.delete(full_url)
-    resp.raise_for_status()
-
-
-def _make_client(token):
-    """Create an httpx.AsyncClient with auth headers for Viya API calls."""
-    if not token.startswith("Bearer "):
-        token = f"Bearer {token}"
-    headers = {"Authorization": token}
-    return httpx.AsyncClient(headers=headers, verify=SSL_VERIFY, timeout=300.0)
-
-
-# ---------------------------------------------------------------------------
-# Original helpers (log/listing fetching)
-# ---------------------------------------------------------------------------
-
-async def _get_text(url, client, verify=True, extra_params=None):
-    # Try text/plain in one shot
-    full_url = f"{VIYA_ENDPOINT}{url}"
-    r = await client.get(
-        full_url, headers={"Accept": "text/plain"}, params=extra_params or {}
-    )
-    if r.status_code == 200 and r.headers.get("Content-Type", "").startswith(
-        "text/plain"
-    ):
-        return r.text
-    # Some deployments need an explicit query hint
-    r = await client.get(
-        full_url,
-        headers={"Accept": "text/plain"},
-        params={**(extra_params or {}), "type": "text"},
-    )
-    if r.status_code == 200 and r.headers.get("Content-Type", "").startswith(
-        "text/plain"
-    ):
-        return r.text
-    return None  # caller will fallback to paged JSON
-
-
-async def _get_paged_lines(url, client, page_limit=10000):
-    start = 0
-    lines = []
-    headers = {"Accept": "application/vnd.sas.collection+json"}
-    full_url = f"{VIYA_ENDPOINT}{url}"
-    while True:
-        resp = await client.get(
-            full_url, headers=headers, params={"start": start, "limit": page_limit}
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        items = data.get("items", [])
-        if not items:
-            break
-        # items can be dicts like {"line": "..."} or {"text": "..."} depending on endpoint
-        for it in items:
-            lines.append(it.get("line") or it.get("text") or "")
-        if len(items) < page_limit:
-            break
-        start += page_limit
-    return "\n".join(lines)
-
-
-async def fetch_full_job_log(client, session_id, job_id):
-    base = f"/compute/sessions/{session_id}/jobs/{job_id}"
-    # 1) Try whole job log as text
-    text = await _get_text(f"{base}/log", client)
-    if text is not None:
-        return text
-    # 2) Fallback to paged JSON
-    return await _get_paged_lines(f"{base}/log", client)
-
-
-async def fetch_full_job_listing(client, session_id, job_id):
-    base = f"/compute/sessions/{session_id}/jobs/{job_id}"
-    text = await _get_text(f"{base}/listing", client)
-    if text is not None:
-        return text
-    return await _get_paged_lines(f"{base}/listing", client)
-
-
-async def fetch_full_session_log(client, session_id):
-    # Entire session log (useful if you want everything the session produced)
-    text = await _get_text(f"/compute/sessions/{session_id}/log", client)
-    if text is not None:
-        return text
-    return await _get_paged_lines(f"/compute/sessions/{session_id}/log", client)
-
-
-async def get_context_id(client, context_name):
-    url = f"{VIYA_ENDPOINT}/compute/contexts?name={context_name}"
-    resp = await client.get(url)
+async def get_context_id(client: httpx.AsyncClient, context_name: str) -> str:
+    """Return the id of the named compute context, raising if it is absent."""
+    url = f"{VIYA_ENDPOINT}/compute/contexts"
+    resp = await client.get(url, params={"name": context_name})
+    raise_for_viya_status(resp)
     coll = resp.json()
     items = coll.get("items", [])
     if not items:
@@ -167,165 +44,287 @@ async def get_context_id(client, context_name):
     return items[0]["id"]
 
 
-async def create_session(client, context_id, name="py-parallel"):
+async def create_session(client: httpx.AsyncClient, context_id: str, name: str = "sas-mcp-usecase") -> str:
+    """Create a compute session in *context_id* and return its id."""
     url = f"{VIYA_ENDPOINT}/compute/contexts/{context_id}/sessions"
     resp = await client.post(url, json={"name": name})
+    raise_for_viya_status(resp)
     return resp.json()["id"]
 
 
-async def submit_job(client, session_id, code):
+async def delete_session(client: httpx.AsyncClient, sid: str) -> None:
+    """Delete compute session *sid* (raises on failure)."""
+    try:
+        await client.delete(f"{VIYA_ENDPOINT}/compute/sessions/{sid}")
+        logger.info("Session %s deleted successfully", sid)
+    except Exception:
+        logger.exception("Failed to delete session %s", sid)
+        raise
+
+
+def _token_user_key(token: str) -> str:
+    """Derive a stable per-user cache key from a Viya access token.
+
+    Viya access tokens are JWTs; the ``sub`` claim (or another identity claim)
+    is read *without* verifying the signature — the auth layer already did. A
+    token that is not a decodable JWT falls back to a hash of the string.
+    """
+    raw = token[7:] if token.startswith("Bearer ") else token
+    parts = raw.split(".")
+    if len(parts) >= 2:
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+            for claim in ("sub", "uid", "user_name", "user_id"):
+                value = payload.get(claim)
+                if value:
+                    return f"{claim}:{value}"
+        except (binascii.Error, ValueError, json.JSONDecodeError):
+            pass
+    return "token:" + hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def session_key(token: str, context_name: str) -> tuple[str, str]:
+    """The cache key for the token's user and compute context.
+
+    In fixed-session mode (``COMPUTE_SESSION_ID``) every caller shares the one
+    session, so the key is constant and the job lock covers them all.
+    """
+    if COMPUTE_SESSION_ID:
+        return ("fixed", COMPUTE_SESSION_ID)
+    return (_token_user_key(token), context_name)
+
+
+async def _session_is_alive(client: httpx.AsyncClient, session_id: str) -> bool:
+    """Return ``True`` if *session_id* still exists server-side."""
+    try:
+        resp = await client.get(f"{VIYA_ENDPOINT}/compute/sessions/{session_id}/state")
+    except httpx.HTTPError:
+        return False
+    return resp.status_code == 200
+
+
+class _ComputeSessionCache:
+    """Process-wide pool of reusable compute sessions, keyed by (user, context)."""
+
+    SESSION_NAME = "sas-mcp-usecase"
+
+    def __init__(self) -> None:
+        # key -> (session_id, most recent token seen). The token is kept so
+        # shutdown can authenticate the delete calls.
+        self._sessions: dict[tuple[str, str], tuple[str, str]] = {}
+        # Serialises create/reset of one key without blocking the others.
+        self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # Serialises the jobs run in one session: a compute session executes
+        # one job at a time, and concurrent chat users share a session in the
+        # headless modes.
+        self._job_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._guard = asyncio.Lock()
+
+    async def _lock_for(self, key: tuple[str, str], table: dict[tuple[str, str], asyncio.Lock]) -> asyncio.Lock:
+        async with self._guard:
+            lock = table.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                table[key] = lock
+            return lock
+
+    async def job_lock_for(self, key: tuple[str, str]) -> asyncio.Lock:
+        return await self._lock_for(key, self._job_locks)
+
+    async def get_or_create(
+        self, client: httpx.AsyncClient, context_name: str, key: tuple[str, str], token: str
+    ) -> str:
+        """Return a live session id for *key*, creating one when needed."""
+        if COMPUTE_SESSION_ID:
+            return COMPUTE_SESSION_ID
+        lock = await self._lock_for(key, self._locks)
+        async with lock:
+            cached = self._sessions.get(key)
+            if cached is not None:
+                sid, _ = cached
+                if await _session_is_alive(client, sid):
+                    logger.info("Reusing cached compute session %s", sid)
+                    self._sessions[key] = (sid, token)
+                    return sid
+                logger.info("Cached compute session %s is gone; recreating", sid)
+                self._sessions.pop(key, None)
+            context_id = await get_context_id(client, context_name)
+            sid = await create_session(client, context_id, name=self.SESSION_NAME)
+            self._sessions[key] = (sid, token)
+            logger.info("Created and cached compute session %s", sid)
+            return sid
+
+    async def reset(self, client: httpx.AsyncClient, key: tuple[str, str]) -> str | None:
+        """Drop the cached session for *key* and delete it server-side."""
+        if COMPUTE_SESSION_ID:
+            return None
+        lock = await self._lock_for(key, self._locks)
+        async with lock:
+            cached = self._sessions.pop(key, None)
+        if cached is None:
+            return None
+        sid, _ = cached
+        await delete_session(client, sid)
+        return sid
+
+    async def abandon(self, client: httpx.AsyncClient, key: tuple[str, str]) -> None:
+        """Forget the session for *key* and delete it best-effort (a wedged job)."""
+        if COMPUTE_SESSION_ID:
+            logger.warning("Job overran in fixed session %s; it is externally managed", COMPUTE_SESSION_ID)
+            return
+        lock = await self._lock_for(key, self._locks)
+        async with lock:
+            cached = self._sessions.pop(key, None)
+        if cached is None:
+            return
+        sid, _ = cached
+        try:
+            await delete_session(client, sid)
+        except Exception:
+            logger.warning("Could not delete abandoned compute session %s", sid, exc_info=True)
+
+    async def shutdown(self) -> None:
+        """Delete every cached compute session server-side (best effort)."""
+        async with self._guard:
+            entries = list(self._sessions.values())
+            self._sessions.clear()
+            self._locks.clear()
+            self._job_locks.clear()
+        if not entries:
+            return
+        logger.info("Deleting %d cached compute session(s) on shutdown", len(entries))
+        for sid, token in entries:
+            try:
+                async with make_client(token) as client:
+                    await delete_session(client, sid)
+            except Exception:
+                logger.warning("Could not delete compute session %s on shutdown", sid, exc_info=True)
+
+    def clear(self) -> None:
+        """Forget all cached sessions without deleting them (test isolation)."""
+        self._sessions.clear()
+        self._locks.clear()
+        self._job_locks.clear()
+
+
+_SESSION_CACHE = _ComputeSessionCache()
+
+
+async def get_cached_session(client: httpx.AsyncClient, context_name: str, token: str) -> str:
+    """Return the reusable compute session id for the token's user + context."""
+    return await _SESSION_CACHE.get_or_create(client, context_name, session_key(token, context_name), token)
+
+
+async def reset_cached_session(client: httpx.AsyncClient, context_name: str, token: str) -> str | None:
+    """Delete and forget the cached compute session for the token's user."""
+    return await _SESSION_CACHE.reset(client, session_key(token, context_name))
+
+
+async def shutdown_session_cache() -> None:
+    """Delete all cached compute sessions server-side (call from server lifespan)."""
+    await _SESSION_CACHE.shutdown()
+
+
+def clear_session_cache() -> None:
+    """Forget all cached compute sessions (test isolation helper)."""
+    _SESSION_CACHE.clear()
+
+
+@asynccontextmanager
+async def locked_session(client: httpx.AsyncClient, token: str, context_name: str = CONTEXT_NAME) -> AsyncIterator[str]:
+    """Yield the caller's warm compute session id while holding its job lock.
+
+    Everything inside the block — submitting the job, reading its result
+    tables back — runs without another caller's job interleaving. A job that
+    overruns ``JOB_POLL_TIMEOUT`` raises :class:`TimeoutError`; the session is
+    then abandoned so the next call starts clean instead of queueing behind
+    the wedged job.
+    """
+    key = session_key(token, context_name)
+    sid = await _SESSION_CACHE.get_or_create(client, context_name, key, token)
+    lock = await _SESSION_CACHE.job_lock_for(key)
+    async with lock:
+        try:
+            yield sid
+        except TimeoutError:
+            await _SESSION_CACHE.abandon(client, key)
+            raise
+
+
+async def submit_job(client: httpx.AsyncClient, session_id: str, code: str) -> str:
+    """Submit *code* as a job in *session_id* and return the job id."""
     body = {"code": code.splitlines()}
     url = f"{VIYA_ENDPOINT}/compute/sessions/{session_id}/jobs"
     resp = await client.post(url, json=body)
-    job = resp.json()
-    return job["id"]
+    # Unchecked, a refused submit is parsed as though it were a job and the
+    # failure reaches the caller as the single word 'id'.
+    raise_for_viya_status(resp)
+    return resp.json()["id"]
 
 
-async def wait_job(client, session_id, job_id, poll=2, timeout=None):
+# Page size for compute log/listing collection fetches, and a loop backstop far
+# above any real log. Hitting the backstop appends an explicit marker.
+_LINES_PAGE_LIMIT = 1000
+_LINES_MAX_PAGES = 10_000
+
+
+async def _fetch_all_lines(client: httpx.AsyncClient, url: str) -> list[str]:
+    """Collect every ``line`` of a compute log/listing collection (it is paged)."""
+    lines: list[str] = []
+    start = 0
+    for _ in range(_LINES_MAX_PAGES):
+        resp = await client.get(url, params={"start": start, "limit": _LINES_PAGE_LIMIT})
+        raise_for_viya_status(resp)
+        items = resp.json().get("items", [])
+        lines.extend(item.get("line", "") for item in items)
+        if len(items) < _LINES_PAGE_LIMIT:
+            return lines
+        start += _LINES_PAGE_LIMIT
+    lines.append(f"[output truncated after {len(lines)} lines]")
+    return lines
+
+
+async def wait_job(
+    client: httpx.AsyncClient,
+    session_id: str,
+    job_id: str,
+    poll: float = 2,
+    timeout: float | None = None,
+) -> tuple[str, str, str]:
+    """Poll *job_id* until it reaches a terminal state; return (state, log, listing).
+
+    Raises :class:`TimeoutError` after *timeout* seconds (default
+    ``JOB_POLL_TIMEOUT``) so a wedged job cannot hang the caller forever.
+    """
     timeout = JOB_POLL_TIMEOUT if timeout is None else timeout
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         state_url = f"{VIYA_ENDPOINT}/compute/sessions/{session_id}/jobs/{job_id}/state"
         resp = await client.get(state_url)
+        # Read as plain text, so an error body would otherwise be treated as a
+        # state name — never a terminal one — and poll forever.
+        raise_for_viya_status(resp)
         state = resp.text.strip()
         if state in ("completed", "error", "warning", "canceled"):
-            # Fetch log
             log_url = f"{VIYA_ENDPOINT}/compute/sessions/{session_id}/jobs/{job_id}/log"
-            log_resp = await client.get(log_url)
-            log = log_resp.json()
-            lines = [item["line"] for item in log.get("items", [])]
-            log_text = "\n".join(lines)
-
-            # Fetch listing (plain text output)
-            listing_url = (
-                f"{VIYA_ENDPOINT}/compute/sessions/{session_id}/jobs/{job_id}/listing"
-            )
-            listing_resp = await client.get(listing_url)
-            listing_json = listing_resp.json()
-            listing_lines = [item["line"] for item in listing_json.get("items", [])]
-            listing_text = (
-                "\n".join(listing_lines) if listing_lines else "(no listing output)"
-            )
-
+            log_text = "\n".join(await _fetch_all_lines(client, log_url))
+            listing_url = f"{VIYA_ENDPOINT}/compute/sessions/{session_id}/jobs/{job_id}/listing"
+            listing_lines = await _fetch_all_lines(client, listing_url)
+            listing_text = "\n".join(listing_lines) if listing_lines else "(no listing output)"
             return state, log_text, listing_text
         if asyncio.get_running_loop().time() > deadline:
             raise TimeoutError(
-                f"SAS job {job_id} did not finish within {timeout:.0f}s "
-                f"(last state: '{state}'). Increase JOB_POLL_TIMEOUT if this "
-                f"job legitimately runs longer."
+                f"SAS job {job_id} did not finish within {timeout:.0f}s (last state: '{state}'). "
+                f"Narrow the query, or raise JOB_POLL_TIMEOUT if it legitimately runs longer."
             )
         await asyncio.sleep(poll)
 
 
-async def run_one_snippet(snippet_data, snippet_id, token):
-    code = snippet_data
-
-    logger.info(f"Creating session with token (length: {len(token)})")
-
-    async with _make_client(token) as client:
-        ctx_id = await get_context_id(client, CONTEXT_NAME)
-        sid = await create_session(client, ctx_id, name="py-parallel")
-        logger.info(f"Session created: {sid}")
-        try:
-            jid = await submit_job(client, sid, code)
-            logger.info(f"Job submitted: {jid}")
-            result = await wait_job(client, sid, jid)
-            logger.info(f"Job completed: {result[0]}")
-            return (snippet_id, *result)
-        except Exception as e:
-            logger.error(f"Error executing SAS job: {str(e)}")
-            raise e
-        finally:
-            try:
-                delete_url = f"{VIYA_ENDPOINT}/compute/sessions/{sid}"
-                await client.delete(delete_url)
-                logger.info(f"Session {sid} deleted successfully")
-            except Exception as e:
-                # Best-effort cleanup: never let a failed session delete mask
-                # the real job result or the original error from the try block.
-                logger.error(f"Failed to delete session {sid}: {str(e)}")
-
-
-# ---------------------------------------------------------------------------
-# Structured query helpers (used by the use-case query/grounding tools)
-# ---------------------------------------------------------------------------
-
-async def fetch_table_columns(client, server, caslib, table, limit=500):
-    """Return column metadata for a CAS table via CAS Management.
-
-    A light wrapper used to ground the agent (e.g. inside get_use_case) without
-    making it write PROC CONTENTS and parse the log.
-    """
-    items, _ = await _get_paged_items(
-        f"/casManagement/servers/{server}/caslibs/{caslib}/tables/{table}/columns",
-        client, limit=limit)
-    return [{"name": c.get("name"), "type": c.get("type"),
-             "label": c.get("label", ""), "format": c.get("format", "")}
-            for c in items]
-
-
-async def fetch_session_table_rows(client, session_id, libref, table_name,
-                                   limit=100):
-    """Fetch a table's columns and rows from inside a live compute session.
-
-    Uses the Compute data API
-    (``/compute/sessions/{id}/data/{libref}/{table}/...``) so a result built in
-    WORK can be read back as structured rows before the session is torn down.
-    Returns ``(column_names, rows)`` where each row is a ``{column: value}`` dict.
-    """
-    base = f"{VIYA_ENDPOINT}/compute/sessions/{session_id}/data/{libref}/{table_name}"
-    col_resp = await client.get(
-        f"{base}/columns", params={"start": 0, "limit": 10000},
-        headers={"Accept": "application/vnd.sas.collection+json"})
-    col_resp.raise_for_status()
-    col_names = [c.get("name") for c in col_resp.json().get("items", [])]
-    row_resp = await client.get(
-        f"{base}/rows", params={"start": 0, "limit": limit},
-        headers={"Accept": "application/vnd.sas.collection+json"})
-    row_resp.raise_for_status()
-    rows = []
-    for item in row_resp.json().get("items", []):
-        cells = item.get("cells", [])
-        rows.append(dict(zip(col_names, cells)))
-    return col_names, rows
-
-
-async def run_query_rows(sql, token, limit=100):
-    """Run a single SQL SELECT and return the result set as structured rows.
-
-    Wraps the SELECT in ``proc sql`` (writing to ``WORK._MCPQ``) inside a fresh
-    compute session, then reads the result back through the Compute data API —
-    so it works even though each call uses a throwaway session that is deleted
-    afterwards. On success returns ``{"error": False, "columns": [...],
-    "rows": [...], "rowCount": n}``; on a SAS error returns ``{"error": True,
-    "state": ..., "log": ...}`` so the caller can correct the query.
-    """
-    statement = (sql or "").strip().rstrip(";")
-    # `caslib _all_ assign` exposes CAS caslibs as SAS librefs so the SELECT can
-    # reference the use-case table by its caslib-qualified name.
-    code = (
-        "cas _mcpcas;\n"
-        "caslib _all_ assign;\n"
-        "proc sql;\n"
-        "  create table work._mcpq as\n"
-        f"  {statement};\n"
-        "quit;"
-    )
-    async with _make_client(token) as client:
-        ctx_id = await get_context_id(client, CONTEXT_NAME)
-        sid = await create_session(client, ctx_id, name="mcp-query")
-        try:
-            jid = await submit_job(client, sid, code)
-            state, log_text, _ = await wait_job(client, sid, jid)
-            if state not in ("completed", "warning"):
-                return {"error": True, "state": state, "log": log_text,
-                        "columns": [], "rows": []}
-            cols, rows = await fetch_session_table_rows(
-                client, sid, "WORK", "_MCPQ", limit=limit)
-            return {"error": False, "state": state, "columns": cols,
-                    "rows": rows, "rowCount": len(rows)}
-        finally:
-            try:
-                await client.delete(f"{VIYA_ENDPOINT}/compute/sessions/{sid}")
-            except Exception as e:
-                logger.error(f"Failed to delete query session {sid}: {str(e)}")
+async def run_job(client: httpx.AsyncClient, session_id: str, code: str, poll: float = 2) -> tuple[str, str, str]:
+    """Submit *code* in *session_id* and wait for it: ``(state, log, listing)``."""
+    job_id = await submit_job(client, session_id, code)
+    logger.info("Job submitted: %s", job_id)
+    state, log_text, listing_text = await wait_job(client, session_id, job_id, poll=poll)
+    logger.info("Job completed: %s", state)
+    return state, log_text, listing_text

@@ -1,6 +1,6 @@
 {
     "servers": {
-        "sas-execution-mcp": {
+        "sas-usecase": {
             "url": "http://localhost:8134/mcp",
             "type": "http"
         }

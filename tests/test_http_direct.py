@@ -5,9 +5,11 @@
 Tests for the direct-auth HTTP server (http_direct_server) — token caching,
 API key middleware, and tool registration.
 """
-import pytest
+
 from unittest.mock import AsyncMock, MagicMock, patch
+
 import httpx
+import pytest
 from fastmcp import Client
 
 from sas_mcp_server import http_direct_server as hds
@@ -49,11 +51,12 @@ def _mock_async_client(post_mock):
 
 async def test_get_viya_token_fetches_via_password_grant():
     post = AsyncMock(return_value=_mock_token_response("tok-abc"))
-    with patch.object(hds, "VIYA_REFRESH_TOKEN", ""), \
-         patch.object(hds, "VIYA_USERNAME", "user"), \
-         patch.object(hds, "VIYA_PASSWORD", "pass"), \
-         patch.object(httpx, "AsyncClient",
-                      return_value=_mock_async_client(post)):
+    with (
+        patch.object(hds, "VIYA_REFRESH_TOKEN", ""),
+        patch.object(hds, "VIYA_USERNAME", "user"),
+        patch.object(hds, "VIYA_PASSWORD", "pass"),
+        patch.object(httpx, "AsyncClient", return_value=_mock_async_client(post)),
+    ):
         token = await hds.get_viya_token()
 
     assert token == "tok-abc"
@@ -65,11 +68,12 @@ async def test_get_viya_token_fetches_via_password_grant():
 
 async def test_get_viya_token_is_cached():
     post = AsyncMock(return_value=_mock_token_response("tok-cached"))
-    with patch.object(hds, "VIYA_REFRESH_TOKEN", ""), \
-         patch.object(hds, "VIYA_USERNAME", "user"), \
-         patch.object(hds, "VIYA_PASSWORD", "pass"), \
-         patch.object(httpx, "AsyncClient",
-                      return_value=_mock_async_client(post)):
+    with (
+        patch.object(hds, "VIYA_REFRESH_TOKEN", ""),
+        patch.object(hds, "VIYA_USERNAME", "user"),
+        patch.object(hds, "VIYA_PASSWORD", "pass"),
+        patch.object(httpx, "AsyncClient", return_value=_mock_async_client(post)),
+    ):
         first = await hds.get_viya_token()
         second = await hds.get_viya_token()
 
@@ -78,15 +82,18 @@ async def test_get_viya_token_is_cached():
 
 
 async def test_get_viya_token_refreshes_after_expiry():
-    post = AsyncMock(side_effect=[
-        _mock_token_response("tok-1", expires_in=30),  # below the margin
-        _mock_token_response("tok-2"),
-    ])
-    with patch.object(hds, "VIYA_REFRESH_TOKEN", ""), \
-         patch.object(hds, "VIYA_USERNAME", "user"), \
-         patch.object(hds, "VIYA_PASSWORD", "pass"), \
-         patch.object(httpx, "AsyncClient",
-                      return_value=_mock_async_client(post)):
+    post = AsyncMock(
+        side_effect=[
+            _mock_token_response("tok-1", expires_in=30),  # below the margin
+            _mock_token_response("tok-2"),
+        ]
+    )
+    with (
+        patch.object(hds, "VIYA_REFRESH_TOKEN", ""),
+        patch.object(hds, "VIYA_USERNAME", "user"),
+        patch.object(hds, "VIYA_PASSWORD", "pass"),
+        patch.object(httpx, "AsyncClient", return_value=_mock_async_client(post)),
+    ):
         first = await hds.get_viya_token()
         second = await hds.get_viya_token()
 
@@ -96,20 +103,23 @@ async def test_get_viya_token_refreshes_after_expiry():
 
 
 async def test_get_viya_token_requires_credentials():
-    with patch.object(hds, "VIYA_REFRESH_TOKEN", ""), \
-         patch.object(hds, "VIYA_USERNAME", ""), \
-         patch.object(hds, "VIYA_PASSWORD", ""):
-        with pytest.raises(hds.AuthenticationError):
-            await hds.get_viya_token()
+    with (
+        patch.object(hds, "VIYA_REFRESH_TOKEN", ""),
+        patch.object(hds, "VIYA_USERNAME", ""),
+        patch.object(hds, "VIYA_PASSWORD", ""),
+        pytest.raises(hds.AuthenticationError),
+    ):
+        await hds.get_viya_token()
 
 
 async def test_get_viya_token_uses_refresh_grant_when_set():
     post = AsyncMock(return_value=_mock_token_response("tok-r"))
-    with patch.object(hds, "VIYA_REFRESH_TOKEN", "rt-1"), \
-         patch.object(hds, "VIYA_USERNAME", ""), \
-         patch.object(hds, "VIYA_PASSWORD", ""), \
-         patch.object(httpx, "AsyncClient",
-                      return_value=_mock_async_client(post)):
+    with (
+        patch.object(hds, "VIYA_REFRESH_TOKEN", "rt-1"),
+        patch.object(hds, "VIYA_USERNAME", ""),
+        patch.object(hds, "VIYA_PASSWORD", ""),
+        patch.object(httpx, "AsyncClient", return_value=_mock_async_client(post)),
+    ):
         token = await hds.get_viya_token()
 
     assert token == "tok-r"
@@ -123,12 +133,13 @@ async def test_get_viya_token_uses_refresh_grant_when_set():
 
 async def test_confidential_client_uses_basic_auth():
     post = AsyncMock(return_value=_mock_token_response("tok-r"))
-    with patch.object(hds, "VIYA_REFRESH_TOKEN", "rt-1"), \
-         patch.object(hds, "VIYA_USERNAME", ""), \
-         patch.object(hds, "VIYA_PASSWORD", ""), \
-         patch.object(hds, "CLIENT_SECRET", "shh"), \
-         patch.object(httpx, "AsyncClient",
-                      return_value=_mock_async_client(post)):
+    with (
+        patch.object(hds, "VIYA_REFRESH_TOKEN", "rt-1"),
+        patch.object(hds, "VIYA_USERNAME", ""),
+        patch.object(hds, "VIYA_PASSWORD", ""),
+        patch.object(hds, "CLIENT_SECRET", "shh"),
+        patch.object(httpx, "AsyncClient", return_value=_mock_async_client(post)),
+    ):
         await hds.get_viya_token()
 
     call = post.call_args
@@ -137,11 +148,12 @@ async def test_confidential_client_uses_basic_auth():
 
 async def test_refresh_grant_preferred_over_password():
     post = AsyncMock(return_value=_mock_token_response("tok-r"))
-    with patch.object(hds, "VIYA_REFRESH_TOKEN", "rt-1"), \
-         patch.object(hds, "VIYA_USERNAME", "user"), \
-         patch.object(hds, "VIYA_PASSWORD", "pass"), \
-         patch.object(httpx, "AsyncClient",
-                      return_value=_mock_async_client(post)):
+    with (
+        patch.object(hds, "VIYA_REFRESH_TOKEN", "rt-1"),
+        patch.object(hds, "VIYA_USERNAME", "user"),
+        patch.object(hds, "VIYA_PASSWORD", "pass"),
+        patch.object(httpx, "AsyncClient", return_value=_mock_async_client(post)),
+    ):
         await hds.get_viya_token()
 
     assert post.call_args[1]["data"]["grant_type"] == "refresh_token"
@@ -150,15 +162,18 @@ async def test_refresh_grant_preferred_over_password():
 async def test_refresh_token_rotation_is_honoured():
     # First refresh returns a rotated refresh token and a short-lived access
     # token; the second refresh must use the rotated token.
-    post = AsyncMock(side_effect=[
-        _mock_token_response("tok-1", expires_in=30, refresh_token="rt-2"),
-        _mock_token_response("tok-2"),
-    ])
-    with patch.object(hds, "VIYA_REFRESH_TOKEN", "rt-1"), \
-         patch.object(hds, "VIYA_USERNAME", ""), \
-         patch.object(hds, "VIYA_PASSWORD", ""), \
-         patch.object(httpx, "AsyncClient",
-                      return_value=_mock_async_client(post)):
+    post = AsyncMock(
+        side_effect=[
+            _mock_token_response("tok-1", expires_in=30, refresh_token="rt-2"),
+            _mock_token_response("tok-2"),
+        ]
+    )
+    with (
+        patch.object(hds, "VIYA_REFRESH_TOKEN", "rt-1"),
+        patch.object(hds, "VIYA_USERNAME", ""),
+        patch.object(hds, "VIYA_PASSWORD", ""),
+        patch.object(httpx, "AsyncClient", return_value=_mock_async_client(post)),
+    ):
         first = await hds.get_viya_token()
         second = await hds.get_viya_token()
 
@@ -175,12 +190,12 @@ async def test_refresh_token_rotation_is_honoured():
 
 async def _inner_ok_app(scope, receive, send):
     from starlette.responses import JSONResponse
+
     await JSONResponse({"ok": True})(scope, receive, send)
 
 
 def _asgi_client(app):
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                             base_url="http://test")
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
 async def test_api_key_middleware_rejects_missing_key():
@@ -200,8 +215,7 @@ async def test_api_key_middleware_accepts_x_api_key_header():
 async def test_api_key_middleware_accepts_bearer_token():
     app = hds.ApiKeyMiddleware(_inner_ok_app, "secret-key")
     async with _asgi_client(app) as client:
-        resp = await client.get(
-            "/mcp", headers={"Authorization": "Bearer secret-key"})
+        resp = await client.get("/mcp", headers={"Authorization": "Bearer secret-key"})
     assert resp.status_code == 200
 
 
@@ -225,22 +239,22 @@ async def test_api_key_middleware_leaves_health_open():
 
 
 def test_build_app_rejects_invalid_transport():
-    with patch.object(hds, "MCP_TRANSPORT", "websocket"):
-        with pytest.raises(ValueError):
-            hds.build_app()
+    with patch.object(hds, "MCP_TRANSPORT", "websocket"), pytest.raises(ValueError):
+        hds.build_app()
 
 
 def test_build_app_passes_transport_to_http_app():
-    with patch.object(hds, "MCP_TRANSPORT", "sse"), \
-         patch.object(hds.mcp, "http_app") as mock_http_app, \
-         patch.object(hds, "MCP_API_KEY", ""):
+    with (
+        patch.object(hds, "MCP_TRANSPORT", "sse"),
+        patch.object(hds.mcp, "http_app") as mock_http_app,
+        patch.object(hds, "MCP_API_KEY", ""),
+    ):
         hds.build_app()
     mock_http_app.assert_called_once_with(transport="sse")
 
 
 def test_build_app_wraps_with_api_key_when_set():
-    with patch.object(hds, "MCP_TRANSPORT", "http"), \
-         patch.object(hds, "MCP_API_KEY", "k"):
+    with patch.object(hds, "MCP_TRANSPORT", "http"), patch.object(hds, "MCP_API_KEY", "k"):
         app = hds.build_app()
     assert isinstance(app, hds.ApiKeyMiddleware)
 
@@ -251,16 +265,12 @@ def test_build_app_wraps_with_api_key_when_set():
 
 
 async def test_all_tools_registered_on_direct_server():
+    from sas_mcp_server.tools import TOOL_NAMES
+
     async with Client(hds.mcp) as client:
         tools = await client.list_tools()
         names = {t.name for t in tools}
-    # The direct server exposes the lean, use-case-scoped tool set.
-    assert "execute_sas_code" in names
-    assert "query_table" in names
-    assert "render_chart" in names
-    assert "score_data" in names
-    assert "get_ml_project_results" in names
-    # Tools removed when scoping to a single use case must not be present.
-    assert "list_reports" not in names
-    assert "create_report_from_template" not in names
-    assert "submit_batch_job" not in names
+    # The direct server exposes exactly the use-case tool set.
+    assert names == set(TOOL_NAMES)
+    for gone in ("execute_sas_code", "query_table", "create_ml_project", "list_reports", "submit_batch_job"):
+        assert gone not in names

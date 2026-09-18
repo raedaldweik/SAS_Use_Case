@@ -21,8 +21,7 @@ password.
 """
 
 
-def select_grant(refresh_token: str = "", username: str = "",
-                 password: str = "") -> dict | None:
+def select_grant(refresh_token: str = "", username: str = "", password: str = "") -> dict | None:
     """Return the OAuth token-request form data for the best available grant.
 
     Preference order:
@@ -46,8 +45,7 @@ def select_grant(refresh_token: str = "", username: str = "",
     return None
 
 
-def client_request(grant_data: dict, client_id: str,
-                   client_secret: str = "") -> tuple[dict, tuple | None]:
+def client_request(grant_data: dict, client_id: str, client_secret: str = "") -> tuple[dict, tuple | None]:
     """Return ``(data, auth)`` for a SAS Logon ``/oauth/token`` request.
 
     Public clients (registered ``allowpublic``/PKCE, no secret) must send

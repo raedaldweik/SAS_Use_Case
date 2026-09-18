@@ -1,90 +1,46 @@
 # Copyright © 2025, SAS Institute Inc., Cary, NC, USA.  All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Tests for the MCP server and tools.
-"""
+"""Tests for the OAuth HTTP server module."""
+
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
-from unittest.mock import MagicMock, patch
-from fastmcp import Context
+from fastmcp import Client, Context
+
+from sas_mcp_server import mcp_server
 from sas_mcp_server.mcp_server import AuthenticationError
-
-
-@pytest.mark.asyncio
-async def test_execute_sas_code_success(sample_sas_code, mock_access_token):
-    """Test successful SAS code execution through the tool."""
-    mock_context = MagicMock(spec=Context)
-    mock_context.get_state.return_value = mock_access_token
-
-    with patch('sas_mcp_server.tools.run_one_snippet') as mock_run:
-        mock_run.return_value = ("1", "completed", "Log output", "Listing output")
-
-        token = await mock_context.get_state("access_token")
-        output = await mock_run(sample_sas_code, "1", token)
-
-        mock_run.assert_called_once_with(sample_sas_code, "1", mock_access_token)
-        assert output == ("1", "completed", "Log output", "Listing output")
-
-
-@pytest.mark.asyncio
-async def test_execute_sas_code_no_token():
-    """Test that execute_sas_code raises error when no token is available."""
-    mock_context = MagicMock(spec=Context)
-    mock_context.get_state.return_value = None
-
-    token = await mock_context.get_state("access_token")
-    assert token is None
-
-
-@pytest.mark.asyncio
-async def test_execute_sas_code_propagates_errors(sample_sas_code, mock_access_token):
-    """Test that errors from run_one_snippet are propagated."""
-    mock_context = MagicMock(spec=Context)
-    mock_context.get_state.return_value = mock_access_token
-
-    with patch('sas_mcp_server.tools.run_one_snippet') as mock_run:
-        mock_run.side_effect = Exception("API Error")
-
-        token = await mock_context.get_state("access_token")
-        with pytest.raises(Exception, match="API Error"):
-            await mock_run(sample_sas_code, "1", token)
+from sas_mcp_server.tools import TOOL_NAMES
 
 
 def test_authentication_error():
-    """Test AuthenticationError exception."""
     error = AuthenticationError("Test error message")
-
     assert error.message == "Test error message"
     assert str(error) == "AuthenticationError: Test error message"
 
 
-@pytest.mark.asyncio
-async def test_execute_sas_code_with_multiline_code(mock_access_token):
-    """Test execute_sas_code with multiline SAS code."""
-    multiline_code = """
-    data work.sample;
-        do i = 1 to 10;
-            x = i * 2;
-            output;
-        end;
-    run;
+async def test_http_get_token_reads_context_state():
+    ctx = MagicMock(spec=Context)
+    ctx.get_state = AsyncMock(return_value="viya-token")
+    assert await mcp_server._http_get_token(ctx) == "viya-token"
+    ctx.get_state.assert_awaited_once_with("access_token")
 
-    proc means data=work.sample;
-        var x;
-    run;
-    """
 
-    mock_context = MagicMock(spec=Context)
-    mock_context.get_state.return_value = mock_access_token
+async def test_http_get_token_requires_a_token():
+    ctx = MagicMock(spec=Context)
+    ctx.get_state = AsyncMock(return_value=None)
+    with pytest.raises(AuthenticationError):
+        await mcp_server._http_get_token(ctx)
 
-    with patch('sas_mcp_server.tools.run_one_snippet') as mock_run:
-        mock_run.return_value = ("1", "completed", "PROC MEANS output", "Statistics")
 
-        token = await mock_context.get_state("access_token")
-        result = await mock_run(multiline_code, "1", token)
+async def test_http_server_exposes_the_use_case_tools_and_prompts():
+    async with Client(mcp_server.mcp) as client:
+        names = {t.name for t in await client.list_tools()}
+        prompts = {p.name for p in await client.list_prompts()}
+    assert names == set(TOOL_NAMES)
+    assert prompts == {"explore_use_case", "score_and_explain"}
 
-        mock_run.assert_called_once()
-        call_args = mock_run.call_args[0]
-        assert call_args[0] == multiline_code
-        assert call_args[1] == "1"
-        assert call_args[2] == mock_access_token
+
+def test_server_announces_its_version():
+    assert mcp_server.SERVER_VERSION
+    assert mcp_server.mcp.version == mcp_server.SERVER_VERSION

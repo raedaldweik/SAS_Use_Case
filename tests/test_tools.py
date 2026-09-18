@@ -1,225 +1,89 @@
 # Copyright © 2025, SAS Institute Inc., Cary, NC, USA.  All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Tests for the new API wrapper functions in viya_utils and tool registration.
-"""
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+"""Unit tests for the generic Viya REST helpers (viya_client)."""
+
+from unittest.mock import AsyncMock, MagicMock
+
 import httpx
-from sas_mcp_server.viya_utils import (
-    _get_json,
-    _get_paged_items,
-    _post_json,
-    _put_data,
-    _delete_resource,
-    _make_client,
+import pytest
+
+from conftest import _make_mock_response
+from sas_mcp_server.viya_client import (
+    contains_filter,
+    delete_resource,
+    get_json,
+    get_paged_items,
+    make_client,
+    post_json,
+    raise_for_viya_status,
+    return_items,
 )
-from sas_mcp_server.tools import _truncate_output
 
 
-# ---------------------------------------------------------------------------
-# _truncate_output (caps execute_sas_code log/listing for the agent context)
-# ---------------------------------------------------------------------------
-
-
-def test_truncate_output_passes_short_text_through():
-    assert _truncate_output("short", limit=100) == "short"
-    assert _truncate_output("", limit=100) == ""
-
-
-def test_truncate_output_caps_long_text():
-    text = "A" * 5000 + "B" * 5000
-    out = _truncate_output(text, limit=1000)
-    assert len(out) < len(text)
-    assert "truncated" in out
-    assert out.startswith("A")   # head preserved
-    assert out.rstrip().endswith("B")  # tail preserved
-
-
-def test_truncate_output_disabled_with_zero_limit():
-    text = "x" * 10000
-    assert _truncate_output(text, limit=0) == text
-
-
-# ---------------------------------------------------------------------------
-# _get_json
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
 async def test_get_json_success(mock_httpx_client, mock_env_vars):
-    """Test _get_json returns parsed JSON."""
-    mock_response = AsyncMock()
-    mock_response.raise_for_status = MagicMock()
-    mock_response.json = MagicMock(return_value={"name": "cas-shared-default"})
-    mock_httpx_client.get.return_value = mock_response
-
-    result = await _get_json("/casManagement/servers/cas1", mock_httpx_client)
-
-    assert result == {"name": "cas-shared-default"}
-    mock_httpx_client.get.assert_called_once()
+    mock_httpx_client.get.return_value = _make_mock_response({"id": "x"})
+    assert await get_json("/some/path", mock_httpx_client) == {"id": "x"}
+    url = mock_httpx_client.get.call_args[0][0]
+    assert url.endswith("/some/path")
+    assert mock_httpx_client.get.call_args[1]["headers"]["Accept"] == "application/json"
 
 
-@pytest.mark.asyncio
-async def test_get_json_with_params(mock_httpx_client, mock_env_vars):
-    """Test _get_json passes query params."""
-    mock_response = AsyncMock()
-    mock_response.raise_for_status = MagicMock()
-    mock_response.json = MagicMock(return_value={"items": []})
-    mock_httpx_client.get.return_value = mock_response
-
-    await _get_json("/test", mock_httpx_client, params={"limit": 10})
-
-    call_kwargs = mock_httpx_client.get.call_args
-    assert call_kwargs[1]["params"] == {"limit": 10}
+async def test_get_paged_items_sends_paging_and_filter(mock_httpx_client, mock_env_vars):
+    mock_httpx_client.get.return_value = _make_mock_response({"items": [{"a": 1}], "count": 7})
+    items, count = await get_paged_items("/coll", mock_httpx_client, limit=5, start=10, filters="eq(name,'x')")
+    assert items == [{"a": 1}] and count == 7
+    params = mock_httpx_client.get.call_args[1]["params"]
+    assert params == {"start": 10, "limit": 5, "filter": "eq(name,'x')"}
+    assert mock_httpx_client.get.call_args[1]["headers"]["Accept"] == "application/vnd.sas.collection+json"
 
 
-@pytest.mark.asyncio
-async def test_get_json_raises_on_error(mock_httpx_client, mock_env_vars):
-    """Test _get_json propagates HTTP errors."""
-    mock_response = AsyncMock()
-    mock_response.raise_for_status = MagicMock(
-        side_effect=httpx.HTTPStatusError("404", request=MagicMock(), response=MagicMock())
-    )
-    mock_httpx_client.get.return_value = mock_response
-
-    with pytest.raises(httpx.HTTPStatusError):
-        await _get_json("/bad/path", mock_httpx_client)
+async def test_post_json_returns_empty_dict_on_204(mock_httpx_client, mock_env_vars):
+    mock_httpx_client.post.return_value = _make_mock_response(status_code=204)
+    assert await post_json("/x", mock_httpx_client, body={"a": 1}) == {}
+    assert mock_httpx_client.post.call_args[1]["json"] == {"a": 1}
 
 
-# ---------------------------------------------------------------------------
-# _get_paged_items
-# ---------------------------------------------------------------------------
+async def test_delete_resource(mock_httpx_client, mock_env_vars):
+    mock_httpx_client.delete.return_value = _make_mock_response(status_code=204)
+    await delete_resource("/x/1", mock_httpx_client)
+    assert mock_httpx_client.delete.call_args[0][0].endswith("/x/1")
 
 
-@pytest.mark.asyncio
-async def test_get_paged_items_success(mock_httpx_client, mock_env_vars):
-    """Test _get_paged_items returns items and count."""
-    mock_response = AsyncMock()
-    mock_response.raise_for_status = MagicMock()
-    mock_response.json = MagicMock(return_value={
-        "items": [{"name": "Public"}, {"name": "Formats"}],
-        "count": 2,
-    })
-    mock_httpx_client.get.return_value = mock_response
-
-    items, count = await _get_paged_items("/casManagement/servers/cas1/caslibs",
-                                          mock_httpx_client, limit=50)
-
-    assert len(items) == 2
-    assert count == 2
-    assert items[0]["name"] == "Public"
+def test_raise_for_viya_status_quotes_the_viya_message():
+    request = httpx.Request("GET", "https://viya/casManagement/servers/x")
+    response = httpx.Response(400, request=request)
+    resp = MagicMock()
+    resp.status_code = 400
+    resp.text = '{"message": "The ID contains invalid characters.", "remediation": "Fix the ID.", "errorCode": 12}'
+    resp.raise_for_status = MagicMock(side_effect=httpx.HTTPStatusError("400", request=request, response=response))
+    with pytest.raises(httpx.HTTPStatusError) as ei:
+        raise_for_viya_status(resp)
+    msg = str(ei.value)
+    assert "HTTP 400 from GET /casManagement/servers/x" in msg
+    assert "The ID contains invalid characters." in msg and "Fix the ID." in msg
 
 
-@pytest.mark.asyncio
-async def test_get_paged_items_with_filter(mock_httpx_client, mock_env_vars):
-    """Test _get_paged_items passes filter parameter."""
-    mock_response = AsyncMock()
-    mock_response.raise_for_status = MagicMock()
-    mock_response.json = MagicMock(return_value={"items": [], "count": 0})
-    mock_httpx_client.get.return_value = mock_response
-
-    await _get_paged_items("/files/files", mock_httpx_client,
-                           filters="contains(name,'test')")
-
-    call_kwargs = mock_httpx_client.get.call_args[1]
-    assert call_kwargs["params"]["filter"] == "contains(name,'test')"
-
-
-# ---------------------------------------------------------------------------
-# _post_json
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_post_json_success(mock_httpx_client, mock_env_vars):
-    """Test _post_json sends body and returns response."""
-    mock_response = AsyncMock()
-    mock_response.raise_for_status = MagicMock()
-    mock_response.status_code = 201
-    mock_response.content = b'{"id": "new-project"}'
-    mock_response.json = MagicMock(return_value={"id": "new-project"})
-    mock_httpx_client.post.return_value = mock_response
-
-    result = await _post_json("/mlPipelineAutomation/projects",
-                              mock_httpx_client, body={"name": "test"})
-
-    assert result == {"id": "new-project"}
-    mock_httpx_client.post.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_post_json_no_content(mock_httpx_client, mock_env_vars):
-    """Test _post_json handles 204 No Content."""
-    mock_response = AsyncMock()
-    mock_response.raise_for_status = MagicMock()
-    mock_response.status_code = 204
-    mock_response.content = b""
-    mock_httpx_client.post.return_value = mock_response
-
-    result = await _post_json("/some/action", mock_httpx_client)
-
-    assert result == {}
-
-
-# ---------------------------------------------------------------------------
-# _put_data
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_put_data_success(mock_httpx_client, mock_env_vars):
-    """Test _put_data uploads raw data."""
-    mock_response = AsyncMock()
-    mock_response.raise_for_status = MagicMock()
-    mock_response.status_code = 201
-    mock_response.content = b'{"tableName": "test"}'
-    mock_response.json = MagicMock(return_value={"tableName": "test"})
-    mock_httpx_client.put.return_value = mock_response
-
-    result = await _put_data("/casManagement/servers/cas1/caslibs/Public/tables/test",
-                             mock_httpx_client, data=b"a,b\n1,2")
-
-    assert result == {"tableName": "test"}
-    mock_httpx_client.put.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# _delete_resource
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_delete_resource_success(mock_httpx_client, mock_env_vars):
-    """Test _delete_resource sends DELETE request."""
-    mock_response = AsyncMock()
-    mock_response.raise_for_status = MagicMock()
-    mock_httpx_client.delete.return_value = mock_response
-
-    await _delete_resource("/jobExecution/jobs/job123", mock_httpx_client)
-
-    mock_httpx_client.delete.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# _make_client
-# ---------------------------------------------------------------------------
+def test_raise_for_viya_status_passes_success():
+    resp = _make_mock_response({"ok": True})
+    raise_for_viya_status(resp)  # no raise
 
 
 def test_make_client_adds_bearer_prefix(mock_env_vars):
-    """Test _make_client adds Bearer prefix when missing."""
-    with patch('sas_mcp_server.viya_utils.httpx.AsyncClient') as mock_cls:
-        mock_cls.return_value = MagicMock()
-        _make_client("my-token")
-        call_kwargs = mock_cls.call_args[1]
-        assert call_kwargs["headers"]["Authorization"] == "Bearer my-token"
+    client = make_client("abc")
+    assert client.headers["Authorization"] == "Bearer abc"
+    client2 = make_client("Bearer xyz")
+    assert client2.headers["Authorization"] == "Bearer xyz"
+    assert "Authorization" not in make_client(None).headers
 
 
-def test_make_client_preserves_bearer_prefix(mock_env_vars):
-    """Test _make_client does not double-prefix Bearer."""
-    with patch('sas_mcp_server.viya_utils.httpx.AsyncClient') as mock_cls:
-        mock_cls.return_value = MagicMock()
-        _make_client("Bearer my-token")
-        call_kwargs = mock_cls.call_args[1]
-        assert call_kwargs["headers"]["Authorization"] == "Bearer my-token"
+def test_return_items_and_contains_filter():
+    assert return_items([{"id": 1, "x": 2}], ["id", "name"]) == [{"id": 1, "name": ""}]
+    assert contains_filter(None) is None
+    assert contains_filter("O'Brien") == "contains(name,'O''Brien')"
+
+
+async def test_async_mock_client_shape():
+    client = AsyncMock(spec=httpx.AsyncClient)
+    client.get.return_value = _make_mock_response({"a": 1})
+    assert (await client.get("u")).json() == {"a": 1}

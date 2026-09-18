@@ -108,8 +108,33 @@ The server uses `grant_type=refresh_token` automatically and refreshes access to
 
 ### Environment file options
 The .env file used by the MCP Server allows for customizable options that the user can set themselves.
+
 | Variable            | Required | Default       | Description                                                 |
 |---------------------|---------|--------------|---------------------------------------------------------------|
+| `VIYA_ENDPOINT`     | Yes     | —            | Viya instance to use                                          |
+| `USE_CASE_NAME` / `USE_CASE_DESCRIPTION` | No | — | Identify the use case (returned by `get_use_case`)       |
+| `ALLOWED_TABLES`    | Recommended | —        | CAS table(s) the assistant may query; the first is the primary table. `table`, `caslib.table` or `server.caslib.table` |
+| `ALLOWED_MODELS` / `ALLOWED_DECISIONS` | Recommended | — | Published MAS module ids or names the assistant may score against |
+| `DEFAULT_CAS_SERVER` / `DEFAULT_CASLIB` | No | `cas-shared-default` / `Public` | Filled in when a table entry omits them |
+| `SCOPE_ENFORCE`     | No      | `true`       | `false` only hides out-of-scope resources instead of blocking them |
+| `CLIENT_ID`         | No      | `sas-mcp`    | OAuth2 Client ID registered in Viya                           |
+| `CLIENT_SECRET`     | No      | —            | OAuth2 client secret — only for a confidential client; leave empty for public/PKCE |
+| `VIYA_REFRESH_TOKEN`| Headless (SSO) | —     | Refresh token for stdio / direct-HTTP mode; required for SSO/federated users, preferred for 24/7 use. Obtain via `examples/get_refresh_token.py` |
+| `VIYA_USERNAME` / `VIYA_PASSWORD` | Headless | — | Password grant for stdio / direct-HTTP mode (non-SSO accounts only) |
+| `MCP_API_KEY`       | Direct HTTP | —        | Static key clients must send (`X-API-Key` or `Authorization: Bearer`) |
+| `MCP_TRANSPORT`     | No      | `http`       | Direct HTTP mode transport: `http` (streamable, `/mcp`) or `sse` (`/sse`) |
+| `HOST_PORT`         | No      |  `8134`      | Host Port the local MCP Server listens on                    |
+| `MCP_SERVER_NAME`   | No      | `SAS Use-Case MCP Server` | Name advertised to MCP clients                     |
+| `MCP_SIGNING_KEY`   | No      | `default`    | Secret key used to sign [FastMCP Proxy JWTs](https://gofastmcp.com/servers/auth/oauth-proxy#param-jwt-signing-key) (HTTP OAuth mode) |
+| `MCP_BASE_URL`      | No      | `http://localhost:{HOST_PORT}` | External URL of the MCP server (set for k8s/reverse proxy deployments) |
+| `COMPUTE_CONTEXT_NAME` | No   | `SAS Job Execution compute context` | Viya compute context the queries run in          |
+| `JOB_POLL_TIMEOUT`  | No      | `600`        | Seconds a query may run before it is abandoned and its session discarded |
+| `MAX_CHART_ROWS` / `MAX_SCORE_RECORDS` | No | `1000` / `100` | Per-call caps for `render_chart` rows and `score_data` records |
+| `SSL_VERIFY`        | No      | `true`       | Set to `false` to disable SSL certificate verification (e.g. for self-signed Viya certificates)  |
+
+The defaults listed here are the variable values used in the Viya setup step. If your SAS Administrator has used a different `CLIENT_ID`, `HOST_PORT` during the OAuth Client registration. Please use those values instead.
+
+---------------------|---------|--------------|---------------------------------------------------------------|
 | `VIYA_ENDPOINT`     | Yes     | —            | Viya instance to use                                          |
 | `CLIENT_ID`         | No      | `sas-mcp`    | OAuth2 Client ID registered in Viya                           |
 | `CLIENT_SECRET`     | No      | —            | OAuth2 client secret — only for a confidential client; leave empty for public/PKCE |
@@ -225,7 +250,7 @@ Each user points their MCP client at the ingress URL:
 ```json
 {
     "servers": {
-        "sas-execution-mcp": {
+        "sas-usecase": {
             "url": "https://sas-mcp.company.com/mcp",
             "type": "http"
         }
@@ -247,17 +272,17 @@ Add to `~/.gemini/settings.json` or your project's `.gemini/settings.json`:
 ```json
 {
     "mcpServers": {
-        "sas-viya-mcp": {
+        "sas-usecase": {
             "command": "uv",
             "args": ["run", "app-stdio"],
-            "cwd": "/path/to/sas-mcp-server",
+            "cwd": "/path/to/SAS_Use_Case",
             "timeout": 60000
         }
     }
 }
 ```
 
-Set `cwd` to the absolute path where `sas-mcp-server` is cloned.
+Set `cwd` to the absolute path where this repository is cloned.
 
 A pre-built example is available at [`examples/gemini-settings.json`](gemini-settings.json).
 

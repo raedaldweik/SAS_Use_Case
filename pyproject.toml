@@ -1,12 +1,13 @@
 [project]
-name = "sas-mcp-server"
-version = "0.1.0"
-description = "Add your description here"
+name = "sas-mcp-usecase"
+version = "2.0.0"
+description = "Use-case edition of the SAS Viya MCP server: query one dataset, score it against ready models in real time, and chart the results."
 readme = "README.md"
 authors = [{name = "SAS Institute Inc."}]
 requires-python = ">=3.12"
 dependencies = [
-    "fastmcp>=3.0.0,<4.0.0",
+    "anyio>=4.0.0",
+    "fastmcp>=4.0.0,<5.0.0",
     "httpx>=0.28.1",
     "pydantic>=2.12.4",
     "python-dotenv>=1.2.1",
@@ -22,9 +23,28 @@ app-http-direct = "sas_mcp_server.http_direct_server:main"
 requires = ["uv_build>=0.8.22,<0.9.0"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+# The distribution is named after the use-case edition; the import package keeps
+# the upstream name so code ported from sassoftware/sas-mcp-server drops in.
+module-name = "sas_mcp_server"
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.0",
     "pytest-asyncio>=0.24.0",
     "ruff>=0.14.4",
 ]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# E/F: pyflakes + pycodestyle, I: isort, B: bugbear, UP: pyupgrade,
+# G: logging-format, SIM: flake8-simplify.
+select = ["E", "F", "I", "B", "UP", "G", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["G004", "B017"]
+"examples/**" = ["E501"]

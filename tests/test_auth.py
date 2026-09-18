@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the shared grant-selection logic used by the headless servers."""
 
-from sas_mcp_server.auth import select_grant, client_request
+from sas_mcp_server.auth import client_request, select_grant
 
 
 def test_refresh_token_wins_over_password():

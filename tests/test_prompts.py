@@ -1,134 +1,41 @@
 # Copyright © 2025, SAS Institute Inc., Cary, NC, USA.  All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Tests for prompt template rendering.
-"""
+"""Tests for prompt template rendering."""
+
 import pytest
-from fastmcp import FastMCP
+from fastmcp import Client, FastMCP
+
 from sas_mcp_server.prompts import register_prompts
 
 
 @pytest.fixture
 def prompt_mcp():
-    """Create a minimal FastMCP instance with prompts registered."""
     mcp = FastMCP("test-prompts")
     register_prompts(mcp)
     return mcp
 
 
-async def _prompt_fn(mcp, name):
-    prompt = await mcp.get_prompt(name)
-    return prompt.fn
-
-
-# ---------------------------------------------------------------------------
-# Test that all prompts are registered
-# ---------------------------------------------------------------------------
-
-
 async def test_all_prompts_registered(prompt_mcp):
-    """Verify every expected prompt is registered."""
-    expected = {
-        "debug_sas_log",
-        "explore_dataset",
-        "data_quality_check",
-        "statistical_analysis",
-        "optimize_sas_code",
-        "explain_sas_code",
-        "sas_macro_builder",
-        "generate_report",
-    }
-    prompts = await prompt_mcp.list_prompts()
-    registered = {p.name for p in prompts}
-    assert expected.issubset(registered), f"Missing prompts: {expected - registered}"
+    async with Client(prompt_mcp) as client:
+        names = {p.name for p in await client.list_prompts()}
+    assert names == {"explore_use_case", "score_and_explain"}
 
 
-# ---------------------------------------------------------------------------
-# Individual prompt rendering tests
-# ---------------------------------------------------------------------------
+async def test_explore_use_case_mentions_the_tools(prompt_mcp):
+    async with Client(prompt_mcp) as client:
+        result = await client.get_prompt("explore_use_case", {"focus": "readmissions"})
+    text = result.messages[0].content.text
+    for tool in ("get_use_case", "query_data", "render_chart"):
+        assert tool in text
+    assert "readmissions" in text
 
 
-async def test_debug_sas_log_basic(prompt_mcp):
-    """Test debug_sas_log renders with required params."""
-    prompt_fn = await _prompt_fn(prompt_mcp, "debug_sas_log")
-    messages = prompt_fn(log_text="ERROR: File not found.")
-    assert len(messages) == 1
-    assert "ERROR: File not found." in messages[0].content.text
-
-
-async def test_debug_sas_log_with_filter(prompt_mcp):
-    """Test debug_sas_log renders with severity filter."""
-    prompt_fn = await _prompt_fn(prompt_mcp, "debug_sas_log")
-    messages = prompt_fn(log_text="some log", severity_filter="ERROR")
-    assert "ERROR" in messages[0].content.text
-
-
-async def test_explore_dataset(prompt_mcp):
-    """Test explore_dataset prompt."""
-    prompt_fn = await _prompt_fn(prompt_mcp, "explore_dataset")
-    messages = prompt_fn(library="WORK", dataset="CARS")
-    assert "WORK.CARS" in messages[0].content.text
-    assert "PROC CONTENTS" in messages[0].content.text
-
-
-async def test_explore_dataset_with_focus_vars(prompt_mcp):
-    """Test explore_dataset with focus variables."""
-    prompt_fn = await _prompt_fn(prompt_mcp, "explore_dataset")
-    messages = prompt_fn(library="WORK", dataset="CARS", focus_vars="mpg, weight")
-    assert "mpg, weight" in messages[0].content.text
-
-
-async def test_data_quality_check(prompt_mcp):
-    """Test data_quality_check prompt."""
-    prompt_fn = await _prompt_fn(prompt_mcp, "data_quality_check")
-    messages = prompt_fn(library="SASHELP", dataset="CLASS")
-    assert "SASHELP.CLASS" in messages[0].content.text
-    assert "completeness" in messages[0].content.text
-
-
-async def test_statistical_analysis(prompt_mcp):
-    """Test statistical_analysis prompt."""
-    prompt_fn = await _prompt_fn(prompt_mcp, "statistical_analysis")
-    messages = prompt_fn(
-        analysis_type="linear regression",
-        response_variable="price",
-        predictors="sqft, bedrooms",
-        dataset="WORK.HOUSES",
-    )
-    content = messages[0].content.text
-    assert "linear regression" in content
-    assert "price" in content
-    assert "sqft, bedrooms" in content
-
-
-async def test_optimize_sas_code(prompt_mcp):
-    """Test optimize_sas_code prompt."""
-    prompt_fn = await _prompt_fn(prompt_mcp, "optimize_sas_code")
-    messages = prompt_fn(sas_code="data test; set big; run;")
-    assert "data test; set big; run;" in messages[0].content.text
-
-
-async def test_explain_sas_code(prompt_mcp):
-    """Test explain_sas_code prompt."""
-    prompt_fn = await _prompt_fn(prompt_mcp, "explain_sas_code")
-    messages = prompt_fn(sas_code="proc sql; quit;", audience_level="beginner")
-    assert "beginner" in messages[0].content.text
-
-
-async def test_sas_macro_builder(prompt_mcp):
-    """Test sas_macro_builder prompt."""
-    prompt_fn = await _prompt_fn(prompt_mcp, "sas_macro_builder")
-    messages = prompt_fn(macro_name="load_data", purpose="Load CSV into CAS")
-    assert "%load_data" in messages[0].content.text
-    assert "Load CSV into CAS" in messages[0].content.text
-
-
-async def test_generate_report(prompt_mcp):
-    """Test generate_report prompt."""
-    prompt_fn = await _prompt_fn(prompt_mcp, "generate_report")
-    messages = prompt_fn(dataset="WORK.SALES", report_type="detailed", output_format="PDF")
-    content = messages[0].content.text
-    assert "detailed" in content
-    assert "PDF" in content
-    assert "WORK.SALES" in content
+async def test_score_and_explain_carries_record_and_model(prompt_mcp):
+    async with Client(prompt_mcp) as client:
+        result = await client.get_prompt("score_and_explain", {"record": "age 64, 3 visits", "model": "readmission_gb"})
+    text = result.messages[0].content.text
+    assert "age 64, 3 visits" in text
+    assert "readmission_gb" in text
+    for tool in ("describe_model", "score_data"):
+        assert tool in text

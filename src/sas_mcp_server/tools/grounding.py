@@ -13,6 +13,9 @@ from ..helpers.mas_helpers import allowed_modules, describe_module
 from ..usecase import UseCaseScope
 from ._common import make_session_helper
 
+# Signatures fetched by get_use_case when no ALLOWED_MODELS pins the models.
+UNSCOPED_MODEL_LIMIT = 10
+
 GUIDANCE = [
     "Answer questions about the data with query_data (a FedSQL SELECT; aggregate and filter there, "
     "and keep results small).",
@@ -58,8 +61,18 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]], scope
                 manifest["primaryTable"] = info
             try:
                 listing = await allowed_modules(client, scope)
+                candidates = listing["models"]
+                # Unscoped, every published module is a candidate; describing
+                # each one costs a request, so only the first few get signatures.
+                if not scope.scoreables and len(candidates) > UNSCOPED_MODEL_LIMIT:
+                    manifest["modelsNote"] = (
+                        f"{len(candidates)} models are published; signatures are shown for the first "
+                        f"{UNSCOPED_MODEL_LIMIT}. Set ALLOWED_MODELS to pin the ones this assistant uses, "
+                        f"or call describe_model for any of them."
+                    )
+                    candidates = candidates[:UNSCOPED_MODEL_LIMIT]
                 models = []
-                for module in listing["models"]:
+                for module in candidates:
                     try:
                         models.append(await describe_module(client, module))
                     except Exception as exc:

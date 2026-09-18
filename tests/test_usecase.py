@@ -261,3 +261,21 @@ async def test_unscoped_server_allows_everything(mcp_server_with_mock_client):
         assert res["scoped"] is False
         await client.call_tool("describe_table", {"table": "cas1.Public.anything"})
     assert any("/servers/cas1/caslibs/Public/tables/anything" in c[0][0] for c in mock_client.get.call_args_list)
+
+
+async def test_get_use_case_caps_signatures_when_unscoped(mcp_server_with_mock_client):
+    mcp, mock_client = mcp_server_with_mock_client
+    many = [{"id": f"m{i}", "name": f"M{i}"} for i in range(14)]
+    route_get(
+        mock_client,
+        [
+            ("/steps", _make_mock_response({"items": [{"id": "score", "inputs": [], "outputs": []}], "count": 1})),
+            ("/microanalyticScore/modules", _make_mock_response({"items": many, "count": len(many)})),
+        ],
+    )
+    async with Client(mcp) as client:
+        res = (await client.call_tool("get_use_case", {})).data
+    assert len(res["models"]) == 10
+    assert "14 models are published" in res["modelsNote"]
+    step_calls = [c for c in mock_client.get.call_args_list if c[0][0].endswith("/steps")]
+    assert len(step_calls) == 10
